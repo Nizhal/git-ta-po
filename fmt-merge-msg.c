@@ -1,11 +1,12 @@
 #define USE_THE_REPOSITORY_VARIABLE
+#define DISABLE_SIGN_COMPARE_WARNINGS
 
 #include "git-compat-util.h"
 #include "config.h"
 #include "environment.h"
 #include "refs.h"
 #include "object-name.h"
-#include "object-store-ll.h"
+#include "object-store.h"
 #include "diff.h"
 #include "diff-merges.h"
 #include "hex.h"

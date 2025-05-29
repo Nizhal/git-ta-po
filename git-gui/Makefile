@@ -1,3 +1,4 @@
+# The default target of this Makefile is...
 all::
 
 # Define V=1 to have a more verbose compile.
@@ -321,7 +322,7 @@ dist-version:
 	@echo $(GITGUI_VERSION) > $(TARDIR)/version
 
 clean::
-	$(RM_RF) $(GITGUI_MAIN) lib/tclIndex po/*.msg
+	$(RM_RF) $(GITGUI_MAIN) lib/tclIndex po/*.msg $(PO_TEMPLATE)
 	$(RM_RF) GIT-VERSION-FILE GIT-GUI-VARS
 ifdef GITGUI_MACOSXAPP
 	$(RM_RF) 'Git Gui.app'* git-gui

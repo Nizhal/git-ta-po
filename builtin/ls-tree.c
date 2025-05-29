@@ -3,12 +3,14 @@
  *
  * Copyright (C) Linus Torvalds, 2005
  */
+#define USE_THE_REPOSITORY_VARIABLE
 #include "builtin.h"
+
 #include "config.h"
 #include "gettext.h"
 #include "hex.h"
 #include "object-name.h"
-#include "object-store-ll.h"
+#include "object-store.h"
 #include "tree.h"
 #include "path.h"
 #include "quote.h"
@@ -329,7 +331,10 @@ static struct ls_tree_cmdmode_to_fmt ls_tree_cmdmode_format[] = {
 	},
 };
 
-int cmd_ls_tree(int argc, const char **argv, const char *prefix)
+int cmd_ls_tree(int argc,
+		const char **argv,
+		const char *prefix,
+		struct repository *repo UNUSED)
 {
 	struct object_id oid;
 	struct tree *tree;

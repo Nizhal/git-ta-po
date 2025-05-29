@@ -1,9 +1,11 @@
+#define USE_THE_REPOSITORY_VARIABLE
+#define DISABLE_SIGN_COMPARE_WARNINGS
+
 #include "builtin.h"
 #include "abspath.h"
 #include "environment.h"
 #include "gettext.h"
 #include "hex.h"
-#include "repository.h"
 #include "config.h"
 #include "lockfile.h"
 #include "object.h"
@@ -13,6 +15,7 @@
 #include "delta.h"
 #include "pack.h"
 #include "path.h"
+#include "read-cache-ll.h"
 #include "refs.h"
 #include "csum-file.h"
 #include "quote.h"
@@ -21,7 +24,7 @@
 #include "packfile.h"
 #include "object-file.h"
 #include "object-name.h"
-#include "object-store-ll.h"
+#include "object-store.h"
 #include "mem-pool.h"
 #include "commit-reach.h"
 #include "khash.h"
@@ -179,6 +182,7 @@ static unsigned long branch_load_count;
 static int failure;
 static FILE *pack_edges;
 static unsigned int show_stats = 1;
+static unsigned int quiet;
 static int global_argc;
 static const char **global_argv;
 static const char *global_prefix;
@@ -206,8 +210,8 @@ static unsigned int object_entry_alloc = 5000;
 static struct object_entry_pool *blocks;
 static struct hashmap object_table;
 static struct mark_set *marks;
-static const char *export_marks_file;
-static const char *import_marks_file;
+static char *export_marks_file;
+static char *import_marks_file;
 static int import_marks_file_from_stream;
 static int import_marks_file_ignore_missing;
 static int import_marks_file_done;
@@ -324,7 +328,7 @@ static void write_branch_report(FILE *rpt, struct branch *b)
 
 static void write_crash_report(const char *err)
 {
-	char *loc = git_pathdup("fast_import_crash_%"PRIuMAX, (uintmax_t) getpid());
+	char *loc = repo_git_path(the_repository, "fast_import_crash_%"PRIuMAX, (uintmax_t) getpid());
 	FILE *rpt = fopen(loc, "w");
 	struct branch *b;
 	unsigned long lu;
@@ -765,7 +769,8 @@ static void start_packfile(void)
 
 	p->pack_fd = pack_fd;
 	p->do_not_close = 1;
-	pack_file = hashfd(pack_fd, p->pack_name);
+	p->repo = the_repository;
+	pack_file = hashfd(the_repository->hash_algo, pack_fd, p->pack_name);
 
 	pack_data = p;
 	pack_size = write_pack_header(pack_file, 0);
@@ -793,8 +798,8 @@ static const char *create_index(void)
 	if (c != last)
 		die("internal consistency error creating the index");
 
-	tmpfile = write_idx_file(NULL, idx, object_count, &pack_idx_opts,
-				 pack_data->hash);
+	tmpfile = write_idx_file(the_repository, NULL, idx, object_count,
+				 &pack_idx_opts, pack_data->hash);
 	free(idx);
 	return tmpfile;
 }
@@ -805,19 +810,20 @@ static char *keep_pack(const char *curr_index_name)
 	struct strbuf name = STRBUF_INIT;
 	int keep_fd;
 
-	odb_pack_name(&name, pack_data->hash, "keep");
-	keep_fd = odb_pack_keep(name.buf);
+	odb_pack_name(pack_data->repo, &name, pack_data->hash, "keep");
+	keep_fd = safe_create_file_with_leading_directories(pack_data->repo,
+							    name.buf);
 	if (keep_fd < 0)
 		die_errno("cannot create keep file");
 	write_or_die(keep_fd, keep_msg, strlen(keep_msg));
 	if (close(keep_fd))
 		die_errno("failed to write keep file");
 
-	odb_pack_name(&name, pack_data->hash, "pack");
+	odb_pack_name(pack_data->repo, &name, pack_data->hash, "pack");
 	if (finalize_object_file(pack_data->pack_name, name.buf))
 		die("cannot store pack file");
 
-	odb_pack_name(&name, pack_data->hash, "idx");
+	odb_pack_name(pack_data->repo, &name, pack_data->hash, "idx");
 	if (finalize_object_file(curr_index_name, name.buf))
 		die("cannot store index file");
 	free((void *)curr_index_name);
@@ -831,7 +837,7 @@ static void unkeep_all_packs(void)
 
 	for (k = 0; k < pack_id; k++) {
 		struct packed_git *p = all_packs[k];
-		odb_pack_name(&name, p->hash, "keep");
+		odb_pack_name(p->repo, &name, p->hash, "keep");
 		unlink_or_warn(name.buf);
 	}
 	strbuf_release(&name);
@@ -873,9 +879,10 @@ static void end_packfile(void)
 
 		close_pack_windows(pack_data);
 		finalize_hashfile(pack_file, cur_pack_oid.hash, FSYNC_COMPONENT_PACK, 0);
-		fixup_pack_header_footer(pack_data->pack_fd, pack_data->hash,
-					 pack_data->pack_name, object_count,
-					 cur_pack_oid.hash, pack_size);
+		fixup_pack_header_footer(the_hash_algo, pack_data->pack_fd,
+					 pack_data->hash, pack_data->pack_name,
+					 object_count, cur_pack_oid.hash,
+					 pack_size);
 
 		if (object_count <= unpack_limit) {
 			if (!loosen_small_pack(pack_data)) {
@@ -888,7 +895,7 @@ static void end_packfile(void)
 		idx_name = keep_pack(create_index());
 
 		/* Register the packfile with core git's machinery. */
-		new_p = add_packed_git(idx_name, strlen(idx_name), 1);
+		new_p = add_packed_git(pack_data->repo, idx_name, strlen(idx_name), 1);
 		if (!new_p)
 			die("core git rejected index %s", idx_name);
 		all_packs[pack_id] = new_p;
@@ -948,15 +955,15 @@ static int store_object(
 	unsigned char hdr[96];
 	struct object_id oid;
 	unsigned long hdrlen, deltalen;
-	git_hash_ctx c;
+	struct git_hash_ctx c;
 	git_zstream s;
 
 	hdrlen = format_object_header((char *)hdr, sizeof(hdr), type,
 				      dat->len);
 	the_hash_algo->init_fn(&c);
-	the_hash_algo->update_fn(&c, hdr, hdrlen);
-	the_hash_algo->update_fn(&c, dat->buf, dat->len);
-	the_hash_algo->final_oid_fn(&oid, &c);
+	git_hash_update(&c, hdr, hdrlen);
+	git_hash_update(&c, dat->buf, dat->len);
+	git_hash_final_oid(&oid, &c);
 	if (oidout)
 		oidcpy(oidout, &oid);
 
@@ -966,8 +973,7 @@ static int store_object(
 	if (e->idx.offset) {
 		duplicate_count_by_type[type]++;
 		return 1;
-	} else if (find_sha1_pack(oid.hash,
-				  get_all_packs(the_repository))) {
+	} else if (find_oid_pack(&oid, get_all_packs(the_repository))) {
 		e->type = type;
 		e->pack_id = MAX_PACK_ID;
 		e->idx.offset = 1; /* just not zero! */
@@ -1091,7 +1097,7 @@ static void stream_blob(uintmax_t len, struct object_id *oidout, uintmax_t mark)
 	struct object_id oid;
 	unsigned long hdrlen;
 	off_t offset;
-	git_hash_ctx c;
+	struct git_hash_ctx c;
 	git_zstream s;
 	struct hashfile_checkpoint checkpoint;
 	int status = Z_OK;
@@ -1102,14 +1108,14 @@ static void stream_blob(uintmax_t len, struct object_id *oidout, uintmax_t mark)
 		|| (pack_size + PACK_SIZE_THRESHOLD + len) < pack_size)
 		cycle_packfile();
 
-	the_hash_algo->init_fn(&checkpoint.ctx);
+	hashfile_checkpoint_init(pack_file, &checkpoint);
 	hashfile_checkpoint(pack_file, &checkpoint);
 	offset = checkpoint.offset;
 
 	hdrlen = format_object_header((char *)out_buf, out_sz, OBJ_BLOB, len);
 
 	the_hash_algo->init_fn(&c);
-	the_hash_algo->update_fn(&c, out_buf, hdrlen);
+	git_hash_update(&c, out_buf, hdrlen);
 
 	crc32_begin(pack_file);
 
@@ -1127,7 +1133,7 @@ static void stream_blob(uintmax_t len, struct object_id *oidout, uintmax_t mark)
 			if (!n && feof(stdin))
 				die("EOF in data (%" PRIuMAX " bytes remaining)", len);
 
-			the_hash_algo->update_fn(&c, in_buf, n);
+			git_hash_update(&c, in_buf, n);
 			s.next_in = in_buf;
 			s.avail_in = n;
 			len -= n;
@@ -1153,7 +1159,7 @@ static void stream_blob(uintmax_t len, struct object_id *oidout, uintmax_t mark)
 		}
 	}
 	git_deflate_end(&s);
-	the_hash_algo->final_oid_fn(&oid, &c);
+	git_hash_final_oid(&oid, &c);
 
 	if (oidout)
 		oidcpy(oidout, &oid);
@@ -1167,8 +1173,7 @@ static void stream_blob(uintmax_t len, struct object_id *oidout, uintmax_t mark)
 		duplicate_count_by_type[OBJ_BLOB]++;
 		truncate_pack(&checkpoint);
 
-	} else if (find_sha1_pack(oid.hash,
-				  get_all_packs(the_repository))) {
+	} else if (find_oid_pack(&oid, get_all_packs(the_repository))) {
 		e->type = OBJ_BLOB;
 		e->pack_id = MAX_PACK_ID;
 		e->idx.offset = 1; /* just not zero! */
@@ -1604,7 +1609,19 @@ static int update_branch(struct branch *b)
 	struct ref_transaction *transaction;
 	struct object_id old_oid;
 	struct strbuf err = STRBUF_INIT;
+	static const char *replace_prefix = "refs/replace/";
 
+	if (starts_with(b->name, replace_prefix) &&
+	    !strcmp(b->name + strlen(replace_prefix),
+		    oid_to_hex(&b->oid))) {
+		if (!quiet)
+			warning("Dropping %s since it would point to "
+				"itself (i.e. to %s)",
+				b->name, oid_to_hex(&b->oid));
+		refs_delete_ref(get_main_ref_store(the_repository),
+				NULL, b->name, NULL, 0);
+		return 0;
+	}
 	if (is_null_oid(&b->oid)) {
 		if (b->delete)
 			refs_delete_ref(get_main_ref_store(the_repository),
@@ -1636,7 +1653,7 @@ static int update_branch(struct branch *b)
 		}
 	}
 	transaction = ref_store_transaction_begin(get_main_ref_store(the_repository),
-						  &err);
+						  0, &err);
 	if (!transaction ||
 	    ref_transaction_update(transaction, b->name, &b->oid, &old_oid,
 				   NULL, NULL, 0, msg, &err) ||
@@ -1671,7 +1688,7 @@ static void dump_tags(void)
 	struct ref_transaction *transaction;
 
 	transaction = ref_store_transaction_begin(get_main_ref_store(the_repository),
-						  &err);
+						  0, &err);
 	if (!transaction) {
 		failure |= error("%s", err.buf);
 		goto cleanup;
@@ -1704,7 +1721,7 @@ static void dump_marks(void)
 	if (!export_marks_file || (import_marks_file && !import_marks_file_done))
 		return;
 
-	if (safe_create_leading_directories_const(export_marks_file)) {
+	if (safe_create_leading_directories_const(the_repository, export_marks_file)) {
 		failure |= error_errno("unable to create leading directories of %s",
 				       export_marks_file);
 		return;
@@ -2005,7 +2022,7 @@ static void parse_and_store_blob(
 	static struct strbuf buf = STRBUF_INIT;
 	uintmax_t len;
 
-	if (parse_data(&buf, big_file_threshold, &len))
+	if (parse_data(&buf, repo_settings_get_big_file_threshold(the_repository), &len))
 		store_object(OBJ_BLOB, &buf, last, oidout, mark);
 	else {
 		if (last) {
@@ -2414,6 +2431,9 @@ static void file_change_m(const char *p, struct branch *b)
 		tree_content_replace(&b->branch_tree, &oid, mode, NULL);
 		return;
 	}
+
+	if (!verify_path(path.buf, mode))
+		die("invalid path '%s'", path.buf);
 	tree_content_set(&b->branch_tree, path.buf, &oid, mode, NULL);
 }
 
@@ -2451,6 +2471,8 @@ static void file_change_cr(const char *p, struct branch *b, int rename)
 			leaf.tree);
 		return;
 	}
+	if (!verify_path(dest.buf, leaf.versions[1].mode))
+		die("invalid path '%s'", dest.buf);
 	tree_content_set(&b->branch_tree, dest.buf,
 		&leaf.versions[1].oid,
 		leaf.versions[1].mode,
@@ -2698,10 +2720,13 @@ static struct hash_list *parse_merge(unsigned int *count)
 
 static void parse_new_commit(const char *arg)
 {
+	static struct strbuf sig = STRBUF_INIT;
 	static struct strbuf msg = STRBUF_INIT;
+	struct string_list siglines = STRING_LIST_INIT_NODUP;
 	struct branch *b;
 	char *author = NULL;
 	char *committer = NULL;
+	char *sig_alg = NULL;
 	char *encoding = NULL;
 	struct hash_list *merge_list = NULL;
 	unsigned int merge_count;
@@ -2725,6 +2750,13 @@ static void parse_new_commit(const char *arg)
 	}
 	if (!committer)
 		die("Expected committer but didn't get one");
+	if (skip_prefix(command_buf.buf, "gpgsig ", &v)) {
+		sig_alg = xstrdup(v);
+		read_next_command();
+		parse_data(&sig, 0, NULL);
+		read_next_command();
+	} else
+		strbuf_setlen(&sig, 0);
 	if (skip_prefix(command_buf.buf, "encoding ", &v)) {
 		encoding = xstrdup(v);
 		read_next_command();
@@ -2798,10 +2830,23 @@ static void parse_new_commit(const char *arg)
 		strbuf_addf(&new_data,
 			"encoding %s\n",
 			encoding);
+	if (sig_alg) {
+		if (!strcmp(sig_alg, "sha1"))
+			strbuf_addstr(&new_data, "gpgsig ");
+		else if (!strcmp(sig_alg, "sha256"))
+			strbuf_addstr(&new_data, "gpgsig-sha256 ");
+		else
+			die("Expected gpgsig algorithm sha1 or sha256, got %s", sig_alg);
+		string_list_split_in_place(&siglines, sig.buf, "\n", -1);
+		strbuf_add_separated_string_list(&new_data, "\n ", &siglines);
+		strbuf_addch(&new_data, '\n');
+	}
 	strbuf_addch(&new_data, '\n');
 	strbuf_addbuf(&new_data, &msg);
+	string_list_clear(&siglines, 1);
 	free(author);
 	free(committer);
+	free(sig_alg);
 	free(encoding);
 
 	if (!store_object(OBJ_COMMIT, &new_data, NULL, &b->oid, next_mark))
@@ -3259,7 +3304,7 @@ static char* make_fast_import_path(const char *path)
 {
 	if (!relative_marks_paths || is_absolute_path(path))
 		return prefix_filename(global_prefix, path);
-	return git_pathdup("info/fast-import/%s", path);
+	return repo_git_path(the_repository, "info/fast-import/%s", path);
 }
 
 static void option_import_marks(const char *marks,
@@ -3274,6 +3319,7 @@ static void option_import_marks(const char *marks,
 			read_marks();
 	}
 
+	free(import_marks_file);
 	import_marks_file = make_fast_import_path(marks);
 	import_marks_file_from_stream = from_stream;
 	import_marks_file_ignore_missing = ignore_missing;
@@ -3316,6 +3362,7 @@ static void option_active_branches(const char *branches)
 
 static void option_export_marks(const char *marks)
 {
+	free(export_marks_file);
 	export_marks_file = make_fast_import_path(marks);
 }
 
@@ -3357,6 +3404,8 @@ static void option_rewrite_submodules(const char *arg, struct string_list *list)
 	free(f);
 
 	string_list_insert(list, s)->util = ms;
+
+	free(s);
 }
 
 static int parse_one_option(const char *option)
@@ -3377,7 +3426,7 @@ static int parse_one_option(const char *option)
 		unsigned long v;
 		if (!git_parse_ulong(option, &v))
 			return 0;
-		big_file_threshold = v;
+		repo_settings_set_big_file_threshold(the_repository, v);
 	} else if (skip_prefix(option, "depth=", &option)) {
 		option_depth(option);
 	} else if (skip_prefix(option, "active-branches=", &option)) {
@@ -3386,6 +3435,7 @@ static int parse_one_option(const char *option)
 		option_export_pack_edges(option);
 	} else if (!strcmp(option, "quiet")) {
 		show_stats = 0;
+		quiet = 1;
 	} else if (!strcmp(option, "stats")) {
 		show_stats = 1;
 	} else if (!strcmp(option, "allow-unsafe-features")) {
@@ -3481,8 +3531,8 @@ static void git_pack_config(void)
 	if (!git_config_get_int("pack.indexversion", &indexversion_value)) {
 		pack_idx_opts.version = indexversion_value;
 		if (pack_idx_opts.version > 2)
-			git_die_config("pack.indexversion",
-					"bad pack.indexVersion=%"PRIu32, pack_idx_opts.version);
+			git_die_config(the_repository, "pack.indexversion",
+				       "bad pack.indexVersion=%"PRIu32, pack_idx_opts.version);
 	}
 	if (!git_config_get_ulong("pack.packsizelimit", &packsizelimit_value))
 		max_packsize = packsizelimit_value;
@@ -3533,12 +3583,14 @@ static void parse_argv(void)
 	build_mark_map(&sub_marks_from, &sub_marks_to);
 }
 
-int cmd_fast_import(int argc, const char **argv, const char *prefix)
+int cmd_fast_import(int argc,
+		    const char **argv,
+		    const char *prefix,
+		    struct repository *repo)
 {
 	unsigned int i;
 
-	if (argc == 2 && !strcmp(argv[1], "-h"))
-		usage(fast_import_usage);
+	show_usage_if_asked(argc, argv, fast_import_usage);
 
 	reset_pack_idx_option(&pack_idx_opts);
 	git_pack_config();
@@ -3654,7 +3706,7 @@ int cmd_fast_import(int argc, const char **argv, const char *prefix)
 		fprintf(stderr, "       pools:    %10lu KiB\n", (unsigned long)((tree_entry_allocd + fi_mem_pool.pool_alloc) /1024));
 		fprintf(stderr, "     objects:    %10" PRIuMAX " KiB\n", (alloc_count*sizeof(struct object_entry))/1024);
 		fprintf(stderr, "---------------------------------------------------------------------\n");
-		pack_report();
+		pack_report(repo);
 		fprintf(stderr, "---------------------------------------------------------------------\n");
 		fprintf(stderr, "\n");
 	}

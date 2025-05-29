@@ -3,7 +3,7 @@
 #include "test-tool.h"
 #include "commit-graph.h"
 #include "repository.h"
-#include "object-store-ll.h"
+#include "object-store.h"
 #include "bloom.h"
 #include "setup.h"
 
@@ -97,7 +97,6 @@ int cmd__read_graph(int argc, const char **argv)
 	}
 
 done:
-	UNLEAK(graph);
-
+	free_commit_graph(graph);
 	return ret;
 }

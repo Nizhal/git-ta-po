@@ -1,8 +1,10 @@
+#define USE_THE_REPOSITORY_VARIABLE
+#define DISABLE_SIGN_COMPARE_WARNINGS
+
 #include "builtin.h"
 #include "environment.h"
 #include "gettext.h"
 #include "hex.h"
-#include "repository.h"
 #include "config.h"
 #include "commit.h"
 #include "tag.h"
@@ -65,7 +67,7 @@ static void set_commit_cutoff(struct commit *commit)
 static void adjust_cutoff_timestamp_for_slop(void)
 {
 	if (cutoff) {
-		/* check for undeflow */
+		/* check for underflow */
 		if (cutoff > TIME_MIN + CUTOFF_DATE_SLOP)
 			cutoff = cutoff - CUTOFF_DATE_SLOP;
 		else
@@ -337,7 +339,7 @@ static int cmp_by_tag_and_age(const void *a_, const void *b_)
 	return a->taggerdate != b->taggerdate;
 }
 
-static int name_ref(const char *path, const struct object_id *oid,
+static int name_ref(const char *path, const char *referent UNUSED, const struct object_id *oid,
 		    int flags UNUSED, void *cb_data)
 {
 	struct object *o = parse_object(the_repository, oid);
@@ -558,11 +560,18 @@ static void name_rev_line(char *p, struct name_ref_data *data)
 	strbuf_release(&buf);
 }
 
-int cmd_name_rev(int argc, const char **argv, const char *prefix)
+int cmd_name_rev(int argc,
+		 const char **argv,
+		 const char *prefix,
+		 struct repository *repo UNUSED)
 {
 	struct mem_pool string_pool;
 	struct object_array revs = OBJECT_ARRAY_INIT;
-	int all = 0, annotate_stdin = 0, transform_stdin = 0, allow_undefined = 1, always = 0, peel_tag = 0;
+
+#ifndef WITH_BREAKING_CHANGES
+	int transform_stdin = 0;
+#endif
+	int all = 0, annotate_stdin = 0, allow_undefined = 1, always = 0, peel_tag = 0;
 	struct name_ref_data data = { 0, 0, STRING_LIST_INIT_NODUP, STRING_LIST_INIT_NODUP };
 	struct option opts[] = {
 		OPT_BOOL(0, "name-only", &data.name_only, N_("print only ref-based names (no object names)")),
@@ -573,11 +582,13 @@ int cmd_name_rev(int argc, const char **argv, const char *prefix)
 				   N_("ignore refs matching <pattern>")),
 		OPT_GROUP(""),
 		OPT_BOOL(0, "all", &all, N_("list all commits reachable from all refs")),
+#ifndef WITH_BREAKING_CHANGES
 		OPT_BOOL_F(0,
 			   "stdin",
 			   &transform_stdin,
 			   N_("deprecated: use --annotate-stdin instead"),
 			   PARSE_OPT_HIDDEN),
+#endif /* WITH_BREAKING_CHANGES */
 		OPT_BOOL(0, "annotate-stdin", &annotate_stdin, N_("annotate text from stdin")),
 		OPT_BOOL(0, "undefined", &allow_undefined, N_("allow to print `undefined` names (default)")),
 		OPT_BOOL(0, "always",     &always,
@@ -592,12 +603,14 @@ int cmd_name_rev(int argc, const char **argv, const char *prefix)
 	git_config(git_default_config, NULL);
 	argc = parse_options(argc, argv, prefix, opts, name_rev_usage, 0);
 
+#ifndef WITH_BREAKING_CHANGES
 	if (transform_stdin) {
 		warning("--stdin is deprecated. Please use --annotate-stdin instead, "
 					"which is functionally equivalent.\n"
 					"This option will be removed in a future release.");
 		annotate_stdin = 1;
 	}
+#endif
 
 	if (all + annotate_stdin + !!argc > 1) {
 		error("Specify either a list, or --all, not both!");
@@ -662,9 +675,9 @@ int cmd_name_rev(int argc, const char **argv, const char *prefix)
 	} else if (all) {
 		int i, max;
 
-		max = get_max_object_index();
+		max = get_max_object_index(the_repository);
 		for (i = 0; i < max; i++) {
-			struct object *obj = get_indexed_object(i);
+			struct object *obj = get_indexed_object(the_repository, i);
 			if (!obj || obj->type != OBJ_COMMIT)
 				continue;
 			show_name(obj, NULL,
@@ -677,7 +690,9 @@ int cmd_name_rev(int argc, const char **argv, const char *prefix)
 				  always, allow_undefined, data.name_only);
 	}
 
-	UNLEAK(string_pool);
-	UNLEAK(revs);
+	string_list_clear(&data.ref_filters, 0);
+	string_list_clear(&data.exclude_filters, 0);
+	mem_pool_discard(&string_pool, 0);
+	object_array_clear(&revs);
 	return 0;
 }

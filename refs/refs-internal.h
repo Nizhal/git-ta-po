@@ -3,7 +3,9 @@
 
 #include "refs.h"
 #include "iterator.h"
+#include "string-list.h"
 
+struct fsck_options;
 struct ref_transaction;
 
 /*
@@ -112,6 +114,20 @@ struct ref_update {
 	void *backend_data;
 	unsigned int type;
 	char *msg;
+	char *committer_info;
+
+	/*
+	 * The index overrides the default sort algorithm. This is needed
+	 * when migrating reflogs and we want to ensure we carry over the
+	 * same order.
+	 */
+	uint64_t index;
+
+	/*
+	 * Used in batched reference updates to mark if a given update
+	 * was rejected.
+	 */
+	enum ref_transaction_error rejection_err;
 
 	/*
 	 * If this ref_update was split off of a symref update via
@@ -133,12 +149,11 @@ int refs_read_raw_ref(struct ref_store *ref_store, const char *refname,
 		      unsigned int *type, int *failure_errno);
 
 /*
- * Write an error to `err` and return a nonzero value iff the same
- * refname appears multiple times in `refnames`. `refnames` must be
- * sorted on entry to this function.
+ * Mark a given update as rejected with a given reason.
  */
-int ref_update_reject_duplicates(struct string_list *refnames,
-				 struct strbuf *err);
+int ref_transaction_maybe_set_rejected(struct ref_transaction *transaction,
+				       size_t update_idx,
+				       enum ref_transaction_error err);
 
 /*
  * Add a ref_update with the specified properties to transaction, and
@@ -153,6 +168,7 @@ struct ref_update *ref_transaction_add_update(
 		const struct object_id *new_oid,
 		const struct object_id *old_oid,
 		const char *new_target, const char *old_target,
+		const char *committer_info,
 		const char *msg);
 
 /*
@@ -181,6 +197,18 @@ enum ref_transaction_state {
 };
 
 /*
+ * Data structure to hold indices of updates which were rejected, for batched
+ * reference updates. While the updates themselves hold the rejection error,
+ * this structure allows a transaction to iterate only over the rejected
+ * updates.
+ */
+struct ref_transaction_rejections {
+	size_t *update_indices;
+	size_t alloc;
+	size_t nr;
+};
+
+/*
  * Data structure for holding a reference transaction, which can
  * consist of checks and updates to multiple references, carried out
  * as atomically as possible.  This structure is opaque to callers.
@@ -188,10 +216,14 @@ enum ref_transaction_state {
 struct ref_transaction {
 	struct ref_store *ref_store;
 	struct ref_update **updates;
+	struct string_list refnames;
 	size_t alloc;
 	size_t nr;
 	enum ref_transaction_state state;
+	struct ref_transaction_rejections *rejections;
 	void *backend_data;
+	unsigned int flags;
+	uint64_t max_index;
 };
 
 /*
@@ -261,11 +293,11 @@ enum do_for_each_ref_flags {
  * the next reference and returns ITER_OK. The data pointed at by
  * refname and oid belong to the iterator; if you want to retain them
  * after calling ref_iterator_advance() again or calling
- * ref_iterator_abort(), you must make a copy. When the iteration has
+ * ref_iterator_free(), you must make a copy. When the iteration has
  * been exhausted, ref_iterator_advance() releases any resources
  * associated with the iteration, frees the ref_iterator object, and
  * returns ITER_DONE. If you want to abort the iteration early, call
- * ref_iterator_abort(), which also frees the ref_iterator object and
+ * ref_iterator_free(), which also frees the ref_iterator object and
  * any associated resources. If there was an internal error advancing
  * to the next entry, ref_iterator_advance() aborts the iteration,
  * frees the ref_iterator, and returns ITER_ERROR.
@@ -281,7 +313,7 @@ enum do_for_each_ref_flags {
  *
  *     while ((ok = ref_iterator_advance(iter)) == ITER_OK) {
  *             if (want_to_stop_iteration()) {
- *                     ok = ref_iterator_abort(iter);
+ *                     ok = ITER_DONE;
  *                     break;
  *             }
  *
@@ -295,10 +327,12 @@ enum do_for_each_ref_flags {
  *
  *     if (ok != ITER_DONE)
  *             handle_error();
+ *     ref_iterator_free(iter);
  */
 struct ref_iterator {
 	struct ref_iterator_vtable *vtable;
 	const char *refname;
+	const char *referent;
 	const struct object_id *oid;
 	unsigned int flags;
 };
@@ -314,18 +348,30 @@ struct ref_iterator {
 int ref_iterator_advance(struct ref_iterator *ref_iterator);
 
 /*
+ * Seek the iterator to the first reference with the given prefix.
+ * The prefix is matched as a literal string, without regard for path
+ * separators. If prefix is NULL or the empty string, seek the iterator to the
+ * first reference again.
+ *
+ * This function is expected to behave as if a new ref iterator with the same
+ * prefix had been created, but allows reuse of iterators and thus may allow
+ * the backend to optimize. Parameters other than the prefix that have been
+ * passed when creating the iterator will remain unchanged.
+ *
+ * Returns 0 on success, a negative error code otherwise.
+ */
+int ref_iterator_seek(struct ref_iterator *ref_iterator,
+		      const char *prefix);
+
+/*
  * If possible, peel the reference currently being viewed by the
  * iterator. Return 0 on success.
  */
 int ref_iterator_peel(struct ref_iterator *ref_iterator,
 		      struct object_id *peeled);
 
-/*
- * End the iteration before it has been exhausted, freeing the
- * reference iterator and any associated resources and returning
- * ITER_DONE. If the abort itself failed, return ITER_ERROR.
- */
-int ref_iterator_abort(struct ref_iterator *ref_iterator);
+/* Free the reference iterator and any associated resources. */
+void ref_iterator_free(struct ref_iterator *ref_iterator);
 
 /*
  * An iterator over nothing (its first ref_iterator_advance() call
@@ -425,13 +471,6 @@ struct ref_iterator *prefix_ref_iterator_begin(struct ref_iterator *iter0,
 void base_ref_iterator_init(struct ref_iterator *iter,
 			    struct ref_iterator_vtable *vtable);
 
-/*
- * Base class destructor for ref_iterators. Destroy the ref_iterator
- * part of iter and shallow-free the object. This is meant to be
- * called only by the destructors of derived classes.
- */
-void base_ref_iterator_free(struct ref_iterator *iter);
-
 /* Virtual function declarations for ref_iterators: */
 
 /*
@@ -443,6 +482,13 @@ void base_ref_iterator_free(struct ref_iterator *iter);
 typedef int ref_iterator_advance_fn(struct ref_iterator *ref_iterator);
 
 /*
+ * Seek the iterator to the first reference matching the given prefix. Should
+ * behave the same as if a new iterator was created with the same prefix.
+ */
+typedef int ref_iterator_seek_fn(struct ref_iterator *ref_iterator,
+				 const char *prefix);
+
+/*
  * Peels the current ref, returning 0 for success or -1 for failure.
  */
 typedef int ref_iterator_peel_fn(struct ref_iterator *ref_iterator,
@@ -450,15 +496,15 @@ typedef int ref_iterator_peel_fn(struct ref_iterator *ref_iterator,
 
 /*
  * Implementations of this function should free any resources specific
- * to the derived class, then call base_ref_iterator_free() to clean
- * up and free the ref_iterator object.
+ * to the derived class.
  */
-typedef int ref_iterator_abort_fn(struct ref_iterator *ref_iterator);
+typedef void ref_iterator_release_fn(struct ref_iterator *ref_iterator);
 
 struct ref_iterator_vtable {
 	ref_iterator_advance_fn *advance;
+	ref_iterator_seek_fn *seek;
 	ref_iterator_peel_fn *peel;
-	ref_iterator_abort_fn *abort;
+	ref_iterator_release_fn *release;
 };
 
 /*
@@ -650,6 +696,10 @@ typedef int read_raw_ref_fn(struct ref_store *ref_store, const char *refname,
 typedef int read_symbolic_ref_fn(struct ref_store *ref_store, const char *refname,
 				 struct strbuf *referent);
 
+typedef int fsck_fn(struct ref_store *ref_store,
+		    struct fsck_options *o,
+		    struct worktree *wt);
+
 struct ref_storage_be {
 	const char *name;
 	ref_store_init_fn *init;
@@ -660,7 +710,6 @@ struct ref_storage_be {
 	ref_transaction_prepare_fn *transaction_prepare;
 	ref_transaction_finish_fn *transaction_finish;
 	ref_transaction_abort_fn *transaction_abort;
-	ref_transaction_commit_fn *initial_transaction_commit;
 
 	pack_refs_fn *pack_refs;
 	rename_ref_fn *rename_ref;
@@ -668,6 +717,11 @@ struct ref_storage_be {
 
 	ref_iterator_begin_fn *iterator_begin;
 	read_raw_ref_fn *read_raw_ref;
+
+	/*
+	 * Please refer to `refs_read_symbolic_ref()` for the expected
+	 * behaviour.
+	 */
 	read_symbolic_ref_fn *read_symbolic_ref;
 
 	reflog_iterator_begin_fn *reflog_iterator_begin;
@@ -677,6 +731,8 @@ struct ref_storage_be {
 	create_reflog_fn *create_reflog;
 	delete_reflog_fn *delete_reflog;
 	reflog_expire_fn *reflog_expire;
+
+	fsck_fn *fsck;
 };
 
 extern struct ref_storage_be refs_be_files;
@@ -705,9 +761,10 @@ struct ref_store {
  * Parse contents of a loose ref file. *failure_errno maybe be set to EINVAL for
  * invalid contents.
  */
-int parse_loose_ref_contents(const char *buf, struct object_id *oid,
+int parse_loose_ref_contents(const struct git_hash_algo *algop,
+			     const char *buf, struct object_id *oid,
 			     struct strbuf *referent, unsigned int *type,
-			     int *failure_errno);
+			     const char **trailing, int *failure_errno);
 
 /*
  * Fill in the generic part of refs and add it to our collection of
@@ -739,13 +796,30 @@ int ref_update_has_null_new_value(struct ref_update *update);
  * If everything is OK, return 0; otherwise, write an error message to
  * err and return -1.
  */
-int ref_update_check_old_target(const char *referent, struct ref_update *update,
-				struct strbuf *err);
+enum ref_transaction_error ref_update_check_old_target(const char *referent,
+						       struct ref_update *update,
+						       struct strbuf *err);
 
 /*
  * Check if the ref must exist, this means that the old_oid or
  * old_target is non NULL.
  */
 int ref_update_expects_existing_old_ref(struct ref_update *update);
+
+/*
+ * Same as `refs_verify_refname_available()`, but checking for a list of
+ * refnames instead of only a single item. This is more efficient in the case
+ * where one needs to check multiple refnames.
+ *
+ * If using batched updates, then individual updates are marked rejected,
+ * reference backends are then in charge of not committing those updates.
+ */
+enum ref_transaction_error refs_verify_refnames_available(struct ref_store *refs,
+					  const struct string_list *refnames,
+					  const struct string_list *extras,
+					  const struct string_list *skip,
+					  struct ref_transaction *transaction,
+					  unsigned int initial_transaction,
+					  struct strbuf *err);
 
 #endif /* REFS_REFS_INTERNAL_H */

@@ -1,10 +1,14 @@
 #!/bin/sh
 
 test_description='multi-pack-indexes'
+
 . ./test-lib.sh
 . "$TEST_DIRECTORY"/lib-chunk.sh
+. "$TEST_DIRECTORY"/lib-midx.sh
 
 GIT_TEST_MULTI_PACK_INDEX=0
+GIT_TEST_MULTI_PACK_INDEX_WRITE_BITMAP=0
+GIT_TEST_MULTI_PACK_INDEX_WRITE_INCREMENTAL=0
 objdir=.git/objects
 
 HASH_LEN=$(test_oid rawsz)
@@ -106,30 +110,6 @@ test_expect_success 'write midx with one v1 pack' '
 	git multi-pack-index --object-dir=$objdir write &&
 	midx_read_expect 1 18 4 $objdir
 '
-
-midx_git_two_modes () {
-	git -c core.multiPackIndex=false $1 >expect &&
-	git -c core.multiPackIndex=true $1 >actual &&
-	if [ "$2" = "sorted" ]
-	then
-		sort <expect >expect.sorted &&
-		mv expect.sorted expect &&
-		sort <actual >actual.sorted &&
-		mv actual.sorted actual
-	fi &&
-	test_cmp expect actual
-}
-
-compare_results_with_midx () {
-	MSG=$1
-	test_expect_success "check normal git operations: $MSG" '
-		midx_git_two_modes "rev-list --objects --all" &&
-		midx_git_two_modes "log --raw" &&
-		midx_git_two_modes "count-objects --verbose" &&
-		midx_git_two_modes "cat-file --batch-all-objects --batch-check" &&
-		midx_git_two_modes "cat-file --batch-all-objects --batch-check --unordered" sorted
-	'
-}
 
 test_expect_success 'write midx with one v2 pack' '
 	git pack-objects --index-version=2,0x40 $objdir/pack/test <obj-list &&
@@ -600,8 +580,7 @@ test_expect_success 'repack preserves multi-pack-index when creating packs' '
 compare_results_with_midx "after repack"
 
 test_expect_success 'multi-pack-index and pack-bitmap' '
-	GIT_TEST_MULTI_PACK_INDEX_WRITE_BITMAP=0 \
-		git -c repack.writeBitmaps=true repack -ad &&
+	git -c repack.writeBitmaps=true repack -ad &&
 	git multi-pack-index write &&
 	git rev-list --test-bitmap HEAD
 '
@@ -1027,6 +1006,61 @@ test_expect_success 'repack --batch-size=<large> repacks everything' '
 	)
 '
 
+test_expect_success 'repack/expire loop' '
+	git init repack-expire &&
+	test_when_finished "rm -fr repack-expire" &&
+	(
+		cd repack-expire &&
+
+		test_commit_bulk 5 &&
+
+		# Create three overlapping pack-files
+		git rev-list --objects HEAD~3 >in-1 &&
+		git rev-list --objects HEAD~4..HEAD~2 >in-2 &&
+		git rev-list --objects HEAD~3..HEAD >in-3 &&
+
+		# Create disconnected blobs
+		obj1=$(git hash-object -w in-1) &&
+		obj2=$(git hash-object -w in-2) &&
+		obj3=$(git hash-object -w in-3) &&
+
+		echo $obj2 >>in-2 &&
+		echo $obj3 >>in-3 &&
+
+		for i in $(test_seq 3)
+		do
+			git pack-objects .git/objects/pack/test-$i <in-$i \
+				|| return 1
+		done &&
+
+		rm -fr .git/objects/pack/pack-* &&
+		git multi-pack-index write &&
+
+		for i in $(test_seq 3)
+		do
+			for file in $(ls .git/objects/pack/test-$i*)
+			do
+				test-tool chmtime =+$((3600*$i-25000)) $file || return 1
+			done || return 1
+		done &&
+
+		pack1=$(ls .git/objects/pack/test-1-*.pack) &&
+		pack2=$(ls .git/objects/pack/test-2-*.pack) &&
+		pack3=$(ls .git/objects/pack/test-3-*.pack) &&
+
+		# Prevent test-1 from being rewritten.
+		touch "${pack1%.pack}.keep" &&
+
+		# This repack-expire loop should repack all non-kept packs
+		# into a new pack and then delete the old packs.
+		git multi-pack-index repack &&
+		git multi-pack-index expire &&
+
+		test_path_is_missing $pack3 &&
+		test_path_is_missing $pack2
+	)
+'
+
 test_expect_success 'load reverse index when missing .idx, .pack' '
 	git init repo &&
 	test_when_finished "rm -fr repo" &&
@@ -1086,7 +1120,7 @@ corrupt_chunk () {
 	corrupt_chunk_file $midx "$@"
 }
 
-test_expect_success 'reader notices too-small oid fanout chunk' '
+test_expect_success PERL_TEST_HELPERS 'reader notices too-small oid fanout chunk' '
 	corrupt_chunk OIDF clear 00000000 &&
 	test_must_fail git log 2>err &&
 	cat >expect <<-\EOF &&
@@ -1096,7 +1130,7 @@ test_expect_success 'reader notices too-small oid fanout chunk' '
 	test_cmp expect err
 '
 
-test_expect_success 'reader notices too-small oid lookup chunk' '
+test_expect_success PERL_TEST_HELPERS 'reader notices too-small oid lookup chunk' '
 	corrupt_chunk OIDL clear 00000000 &&
 	test_must_fail git log 2>err &&
 	cat >expect <<-\EOF &&
@@ -1106,7 +1140,7 @@ test_expect_success 'reader notices too-small oid lookup chunk' '
 	test_cmp expect err
 '
 
-test_expect_success 'reader notices too-small pack names chunk' '
+test_expect_success PERL_TEST_HELPERS 'reader notices too-small pack names chunk' '
 	# There is no NUL to terminate the name here, so the
 	# chunk is too short.
 	corrupt_chunk PNAM clear 70656666 &&
@@ -1117,7 +1151,7 @@ test_expect_success 'reader notices too-small pack names chunk' '
 	test_cmp expect err
 '
 
-test_expect_success 'reader handles unaligned chunks' '
+test_expect_success PERL_TEST_HELPERS 'reader handles unaligned chunks' '
 	# A 9-byte PNAM means all of the subsequent chunks
 	# will no longer be 4-byte aligned, but it is still
 	# a valid one-pack chunk on its own (it is "foo.pack\0").
@@ -1131,7 +1165,7 @@ test_expect_success 'reader handles unaligned chunks' '
 	test_cmp expect.err err
 '
 
-test_expect_success 'reader notices too-small object offset chunk' '
+test_expect_success PERL_TEST_HELPERS 'reader notices too-small object offset chunk' '
 	corrupt_chunk OOFF clear 00000000 &&
 	test_must_fail git log 2>err &&
 	cat >expect <<-\EOF &&
@@ -1141,7 +1175,7 @@ test_expect_success 'reader notices too-small object offset chunk' '
 	test_cmp expect err
 '
 
-test_expect_success 'reader bounds-checks large offset table' '
+test_expect_success PERL_TEST_HELPERS 'reader bounds-checks large offset table' '
 	# re-use the objects64 dir here to cheaply get access to a midx
 	# with large offsets.
 	git init repo &&
@@ -1163,7 +1197,7 @@ test_expect_success 'reader bounds-checks large offset table' '
 	)
 '
 
-test_expect_success 'reader notices too-small revindex chunk' '
+test_expect_success PERL_TEST_HELPERS 'reader notices too-small revindex chunk' '
 	# We only get a revindex with bitmaps (and likewise only
 	# load it when they are asked for).
 	test_config repack.writeBitmaps true &&
@@ -1180,7 +1214,7 @@ test_expect_success 'reader notices too-small revindex chunk' '
 	test_cmp expect.err err
 '
 
-test_expect_success 'reader notices out-of-bounds fanout' '
+test_expect_success PERL_TEST_HELPERS 'reader notices out-of-bounds fanout' '
 	# This is similar to the out-of-bounds fanout test in t5318. The values
 	# in adjacent entries should be large but not identical (they
 	# are used as hi/lo starts for a binary search, which would then abort

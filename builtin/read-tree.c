@@ -3,7 +3,7 @@
  *
  * Copyright (C) Linus Torvalds, 2005
  */
-
+#define USE_THE_REPOSITORY_VARIABLE
 #include "builtin.h"
 #include "config.h"
 #include "gettext.h"
@@ -16,7 +16,6 @@
 #include "cache-tree.h"
 #include "unpack-trees.h"
 #include "parse-options.h"
-#include "repository.h"
 #include "resolve-undo.h"
 #include "setup.h"
 #include "sparse-index.h"
@@ -108,7 +107,10 @@ static int git_read_tree_config(const char *var, const char *value,
 	return git_default_config(var, value, ctx, cb);
 }
 
-int cmd_read_tree(int argc, const char **argv, const char *cmd_prefix)
+int cmd_read_tree(int argc,
+		  const char **argv,
+		  const char *cmd_prefix,
+		  struct repository *repo UNUSED)
 {
 	int i, stage = 0;
 	struct object_id oid;
@@ -133,9 +135,14 @@ int cmd_read_tree(int argc, const char **argv, const char *cmd_prefix)
 			 N_("3-way merge in presence of adds and removes")),
 		OPT_BOOL(0, "reset", &opts.reset,
 			 N_("same as -m, but discard unmerged entries")),
-		{ OPTION_STRING, 0, "prefix", &opts.prefix, N_("<subdirectory>/"),
-		  N_("read the tree into the index under <subdirectory>/"),
-		  PARSE_OPT_NONEG },
+		{
+			.type = OPTION_STRING,
+			.long_name = "prefix",
+			.value = &opts.prefix,
+			.argh = N_("<subdirectory>/"),
+			.help = N_("read the tree into the index under <subdirectory>/"),
+			.flags = PARSE_OPT_NONEG,
+		},
 		OPT_BOOL('u', NULL, &opts.update,
 			 N_("update working tree with merge result")),
 		OPT_CALLBACK_F(0, "exclude-per-directory", &opts,

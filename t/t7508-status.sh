@@ -5,7 +5,6 @@
 
 test_description='git status'
 
-TEST_PASSES_SANITIZE_LEAK=true
 . ./test-lib.sh
 . "$TEST_DIRECTORY"/lib-terminal.sh
 
@@ -1067,7 +1066,7 @@ test_expect_success 'status -s submodule summary (clean submodule)' '
 
 test_expect_success 'status -z implies porcelain' '
 	git status --porcelain |
-	perl -pe "s/\012/\000/g" >expect &&
+	tr "\012" "\000" >expect &&
 	git status -z >output &&
 	test_cmp expect output
 '
@@ -1700,7 +1699,7 @@ test_expect_success 'setup slow status advice' '
 		EOF
 		git add .gitignore &&
 		git commit -m "Add .gitignore" &&
-		git config advice.statusuoption true
+		git config set advice.statusuoption true
 	)
 '
 

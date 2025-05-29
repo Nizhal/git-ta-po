@@ -147,7 +147,10 @@ static int send_pack_config(const char *k, const char *v,
 	return git_default_config(k, v, ctx, cb);
 }
 
-int cmd_send_pack(int argc, const char **argv, const char *prefix)
+int cmd_send_pack(int argc,
+		  const char **argv,
+		  const char *prefix,
+		  struct repository *repo)
 {
 	struct refspec rs = REFSPEC_INIT_PUSH;
 	const char *remote_name = NULL;
@@ -208,7 +211,7 @@ int cmd_send_pack(int argc, const char **argv, const char *prefix)
 		OPT_END()
 	};
 
-	git_config(send_pack_config, NULL);
+	repo_config(repo, send_pack_config, NULL);
 	argc = parse_options(argc, argv, prefix, options, send_pack_usage, 0);
 	if (argc > 0) {
 		dest = argv[0];
@@ -313,7 +316,7 @@ int cmd_send_pack(int argc, const char **argv, const char *prefix)
 	set_ref_status_for_push(remote_refs, args.send_mirror,
 		args.force_update);
 
-	ret = send_pack(&args, fd, conn, remote_refs, &extra_have);
+	ret = send_pack(repo, &args, fd, conn, remote_refs, &extra_have);
 
 	if (helper_status)
 		print_helper_status(remote_refs);
@@ -336,7 +339,11 @@ int cmd_send_pack(int argc, const char **argv, const char *prefix)
 		/* stable plumbing output; do not modify or localize */
 		fprintf(stderr, "Everything up-to-date\n");
 
+	string_list_clear(&push_options, 0);
 	free_refs(remote_refs);
 	free_refs(local_refs);
+	refspec_clear(&rs);
+	oid_array_clear(&shallow);
+	clear_cas_option(&cas);
 	return ret;
 }

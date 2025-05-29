@@ -48,6 +48,7 @@ struct ref_array_item {
 	struct commit *commit;
 	struct atom_value *value;
 	struct ahead_behind_count **counts;
+	char **is_base;
 
 	char refname[FLEX_ARRAY];
 };
@@ -98,9 +99,6 @@ struct ref_format {
 	/* Internal state to ref-filter */
 	int need_color_reset_at_eol;
 
-	/* List of bases for ahead-behind counts. */
-	struct string_list bases;
-
 	struct {
 		int max_count;
 		int omit_empty;
@@ -113,15 +111,19 @@ struct ref_format {
 }
 #define REF_FORMAT_INIT {             \
 	.use_color = -1,              \
-	.bases = STRING_LIST_INIT_DUP, \
 }
 
 /*  Macros for checking --merged and --no-merged options */
-#define _OPT_MERGED_NO_MERGED(option, filter, h) \
-	{ OPTION_CALLBACK, 0, option, (filter), N_("commit"), (h), \
-	  PARSE_OPT_LASTARG_DEFAULT | PARSE_OPT_NONEG, \
-	  parse_opt_merge_filter, (intptr_t) "HEAD" \
-	}
+#define _OPT_MERGED_NO_MERGED(option, filter, h) { \
+	.type = OPTION_CALLBACK, \
+	.long_name = option, \
+	.value = (filter), \
+	.argh = N_("commit"), \
+	.help = (h), \
+	.flags = PARSE_OPT_LASTARG_DEFAULT | PARSE_OPT_NONEG, \
+	.callback = parse_opt_merge_filter, \
+	.defval = (intptr_t) "HEAD", \
+}
 #define OPT_MERGED(f, h) _OPT_MERGED_NO_MERGED("merged", f, h)
 #define OPT_NO_MERGED(f, h) _OPT_MERGED_NO_MERGED("no-merged", f, h)
 
@@ -200,8 +202,16 @@ struct ref_array_item *ref_array_push(struct ref_array *array,
  * If this is not called, then any ahead-behind atoms will be blank.
  */
 void filter_ahead_behind(struct repository *r,
-			 struct ref_format *format,
 			 struct ref_array *array);
+
+/*
+ * If the provided format includes is-base atoms, then compute the base checks
+ * for those tips against all refs.
+ *
+ * If this is not called, then any is-base atoms will be blank.
+ */
+void filter_is_base(struct repository *r,
+		    struct ref_array *array);
 
 void ref_filter_init(struct ref_filter *filter);
 void ref_filter_clear(struct ref_filter *filter);

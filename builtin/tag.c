@@ -6,6 +6,9 @@
  * Based on git-tag.sh and mktag.c by Linus Torvalds.
  */
 
+#define USE_THE_REPOSITORY_VARIABLE
+#define DISABLE_SIGN_COMPARE_WARNINGS
+
 #include "builtin.h"
 #include "advice.h"
 #include "config.h"
@@ -14,8 +17,9 @@
 #include "gettext.h"
 #include "hex.h"
 #include "refs.h"
+#include "object-file.h"
 #include "object-name.h"
-#include "object-store-ll.h"
+#include "object-store.h"
 #include "path.h"
 #include "tag.h"
 #include "parse-options.h"
@@ -160,16 +164,16 @@ static int do_sign(struct strbuf *buffer, struct object_id **compat_oid,
 	const struct git_hash_algo *compat = the_repository->compat_hash_algo;
 	struct strbuf sig = STRBUF_INIT, compat_sig = STRBUF_INIT;
 	struct strbuf compat_buf = STRBUF_INIT;
-	const char *keyid = get_signing_key();
+	char *keyid = get_signing_key();
 	int ret = -1;
 
 	if (sign_buffer(buffer, &sig, keyid))
-		return -1;
+		goto out;
 
 	if (compat) {
 		const struct git_hash_algo *algo = the_repository->hash_algo;
 
-		if (convert_object_file(&compat_buf, algo, compat,
+		if (convert_object_file(the_repository ,&compat_buf, algo, compat,
 					buffer->buf, buffer->len, OBJ_TAG, 1))
 			goto out;
 		if (sign_buffer(&compat_buf, &compat_sig, keyid))
@@ -190,6 +194,7 @@ out:
 	strbuf_release(&sig);
 	strbuf_release(&compat_sig);
 	strbuf_release(&compat_buf);
+	free(keyid);
 	return ret;
 }
 
@@ -446,18 +451,10 @@ static int parse_msg_arg(const struct option *opt, const char *arg, int unset)
 	return 0;
 }
 
-static int strbuf_check_tag_ref(struct strbuf *sb, const char *name)
-{
-	if (name[0] == '-')
-		return -1;
-
-	strbuf_reset(sb);
-	strbuf_addf(sb, "refs/tags/%s", name);
-
-	return check_refname_format(sb->buf, 0);
-}
-
-int cmd_tag(int argc, const char **argv, const char *prefix)
+int cmd_tag(int argc,
+	    const char **argv,
+	    const char *prefix,
+	    struct repository *repo UNUSED)
 {
 	struct strbuf buf = STRBUF_INIT;
 	struct strbuf ref = STRBUF_INIT;
@@ -483,9 +480,16 @@ int cmd_tag(int argc, const char **argv, const char *prefix)
 	int edit_flag = 0;
 	struct option options[] = {
 		OPT_CMDMODE('l', "list", &cmdmode, N_("list tag names"), 'l'),
-		{ OPTION_INTEGER, 'n', NULL, &filter.lines, N_("n"),
-				N_("print <n> lines of each tag message"),
-				PARSE_OPT_OPTARG, NULL, 1 },
+		{
+			.type = OPTION_INTEGER,
+			.short_name = 'n',
+			.value = &filter.lines,
+			.precision = sizeof(filter.lines),
+			.argh = N_("n"),
+			.help = N_("print <n> lines of each tag message"),
+			.flags = PARSE_OPT_OPTARG,
+			.defval = 1,
+		},
 		OPT_CMDMODE('d', "delete", &cmdmode, N_("delete tags"), 'd'),
 		OPT_CMDMODE('v', "verify", &cmdmode, N_("verify tags"), 'v'),
 
@@ -517,9 +521,14 @@ int cmd_tag(int argc, const char **argv, const char *prefix)
 			N_("do not output a newline after empty formatted refs")),
 		OPT_REF_SORT(&sorting_options),
 		{
-			OPTION_CALLBACK, 0, "points-at", &filter.points_at, N_("object"),
-			N_("print only tags of the object"), PARSE_OPT_LASTARG_DEFAULT,
-			parse_opt_object_name, (intptr_t) "HEAD"
+			.type = OPTION_CALLBACK,
+			.long_name = "points-at",
+			.value = &filter.points_at,
+			.argh = N_("object"),
+			.help = N_("print only tags of the object"),
+			.flags = PARSE_OPT_LASTARG_DEFAULT,
+			.callback = parse_opt_object_name,
+			.defval = (intptr_t) "HEAD",
 		},
 		OPT_STRING(  0 , "format", &format.format, N_("format"),
 			   N_("format to use for the output")),
@@ -646,7 +655,7 @@ int cmd_tag(int argc, const char **argv, const char *prefix)
 	if (repo_get_oid(the_repository, object_ref, &object))
 		die(_("Failed to resolve '%s' as a valid ref."), object_ref);
 
-	if (strbuf_check_tag_ref(&ref, tag))
+	if (check_tag_ref(&ref, tag))
 		die(_("'%s' is not a valid tag name."), tag);
 
 	if (refs_read_ref(get_main_ref_store(the_repository), ref.buf, &prev))
@@ -671,13 +680,13 @@ int cmd_tag(int argc, const char **argv, const char *prefix)
 	if (create_tag_object) {
 		if (force_sign_annotate && !annotate)
 			opt.sign = 1;
-		path = git_pathdup("TAG_EDITMSG");
+		path = repo_git_path(the_repository, "TAG_EDITMSG");
 		create_tag(&object, object_ref, tag, &buf, &opt, &prev, &object,
 			   &trailer_args, path);
 	}
 
 	transaction = ref_store_transaction_begin(get_main_ref_store(the_repository),
-						  &err);
+						  0, &err);
 	if (!transaction ||
 	    ref_transaction_update(transaction, ref.buf, &object, &prev,
 				   NULL, NULL,

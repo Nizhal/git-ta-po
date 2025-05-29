@@ -108,7 +108,7 @@ test_expect_success 'scalar register warns when background maintenance fails' '
 	git init register-repo &&
 	GIT_TEST_MAINT_SCHEDULER="crontab:false,launchctl:false,schtasks:false" \
 		scalar register register-repo 2>err &&
-	grep "could not turn on maintenance" err
+	grep "could not toggle maintenance" err
 '
 
 test_expect_success 'scalar unregister' '
@@ -127,6 +127,17 @@ test_expect_success 'scalar unregister' '
 
 	# scalar unregister should be idempotent
 	scalar unregister vanish
+'
+
+test_expect_success 'scalar register --no-maintenance' '
+	git init register-no-maint &&
+	event_log="$(pwd)/no-maint.event" &&
+	GIT_TEST_MAINT_SCHEDULER="crontab:false,launchctl:false,schtasks:false" \
+	GIT_TRACE2_EVENT="$event_log" \
+	GIT_TRACE2_EVENT_DEPTH=100 \
+		scalar register --no-maintenance register-no-maint 2>err &&
+	test_must_be_empty err &&
+	test_subcommand ! git maintenance unregister --force <no-maint.event
 '
 
 test_expect_success 'set up repository to clone' '
@@ -150,7 +161,8 @@ test_expect_success 'scalar clone' '
 			"$(pwd)" &&
 
 		git for-each-ref --format="%(refname)" refs/remotes/origin/ >actual &&
-		echo "refs/remotes/origin/parallel" >expect &&
+		echo "refs/remotes/origin/HEAD" >>expect &&
+		echo "refs/remotes/origin/parallel" >>expect &&
 		test_cmp expect actual &&
 
 		test_path_is_missing 1/2 &&
@@ -169,6 +181,24 @@ test_expect_success 'scalar clone' '
 	)
 '
 
+test_expect_success 'scalar clone --no-... opts' '
+	# Note: redirect stderr always to avoid having a verbose test
+	# run result in a difference in the --[no-]progress option.
+	GIT_TRACE2_EVENT="$(pwd)/no-opt-trace" scalar clone \
+		--no-tags --no-src \
+		"file://$(pwd)" no-opts --single-branch 2>/dev/null &&
+
+	test_subcommand git fetch --quiet --no-progress \
+			origin --no-tags <no-opt-trace &&
+	(
+		cd no-opts &&
+
+		test_cmp_config --no-tags remote.origin.tagopt &&
+		git for-each-ref --format="%(refname)" refs/tags/ >tags &&
+		test_line_count = 0 tags
+	)
+'
+
 test_expect_success 'scalar reconfigure' '
 	git init one/src &&
 	scalar register one &&
@@ -176,8 +206,22 @@ test_expect_success 'scalar reconfigure' '
 	scalar reconfigure one &&
 	test true = "$(git -C one/src config core.preloadIndex)" &&
 	git -C one/src config core.preloadIndex false &&
-	scalar reconfigure -a &&
-	test true = "$(git -C one/src config core.preloadIndex)"
+	rm one/src/cron.txt &&
+	GIT_TRACE2_EVENT="$(pwd)/reconfigure" scalar reconfigure -a &&
+	test_path_is_file one/src/cron.txt &&
+	test true = "$(git -C one/src config core.preloadIndex)" &&
+	test_subcommand git maintenance start <reconfigure &&
+	test_subcommand ! git maintenance unregister --force <reconfigure &&
+
+	GIT_TRACE2_EVENT="$(pwd)/reconfigure-maint-disable" \
+		scalar reconfigure -a --maintenance=disable &&
+	test_subcommand ! git maintenance start <reconfigure-maint-disable &&
+	test_subcommand git maintenance unregister --force <reconfigure-maint-disable &&
+
+	GIT_TRACE2_EVENT="$(pwd)/reconfigure-maint-keep" \
+		scalar reconfigure --maintenance=keep -a &&
+	test_subcommand ! git maintenance start <reconfigure-maint-keep &&
+	test_subcommand ! git maintenance unregister --force <reconfigure-maint-keep
 '
 
 test_expect_success 'scalar reconfigure --all with includeIf.onbranch' '
@@ -198,7 +242,7 @@ test_expect_success 'scalar reconfigure --all with includeIf.onbranch' '
 	done
 '
 
- test_expect_success 'scalar reconfigure --all with detached HEADs' '
+test_expect_success 'scalar reconfigure --all with detached HEADs' '
 	repos="two three four" &&
 	for num in $repos
 	do

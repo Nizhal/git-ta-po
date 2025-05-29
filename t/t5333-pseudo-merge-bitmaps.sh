@@ -28,9 +28,8 @@ test_pseudo_merges_reused () {
 
 tag_everything () {
 	git rev-list --all --no-object-names >in &&
-	perl -lne '
-		print "create refs/tags/" . $. . " " . $1 if /([0-9a-f]+)/
-	' <in | git update-ref --stdin
+	sed 's|\(.*\)|create refs/tags/\1 \1|' in |
+	git update-ref --stdin
 }
 
 test_expect_success 'setup' '
@@ -102,7 +101,7 @@ test_expect_success 'stale bitmap traversal with pseudo-merges' '
 	test_cmp expect actual
 '
 
-test_expect_success 'bitmapPseudoMerge.sampleRate adjusts commit selection rate' '
+test_expect_success PERL_TEST_HELPERS 'bitmapPseudoMerge.sampleRate adjusts commit selection rate' '
 	test_config bitmapPseudoMerge.test.pattern "refs/tags/" &&
 	test_config bitmapPseudoMerge.test.maxMerges 1 &&
 	test_config bitmapPseudoMerge.test.stableThreshold never &&
@@ -208,7 +207,8 @@ test_expect_success 'bitmapPseudoMerge.stableThreshold creates stable groups' '
 '
 
 test_expect_success 'out of order thresholds are rejected' '
-	test_must_fail git \
+	# Disable the test var to remove a stderr message.
+	test_must_fail env GIT_TEST_NAME_HASH_VERSION=1 git \
 		-c bitmapPseudoMerge.test.pattern="refs/*" \
 		-c bitmapPseudoMerge.test.threshold=1.month.ago \
 		-c bitmapPseudoMerge.test.stableThreshold=1.week.ago \
@@ -234,8 +234,7 @@ test_expect_success 'pseudo-merge pattern with capture groups' '
 			test_commit_bulk 16 &&
 
 			git rev-list HEAD~16.. >in &&
-
-			perl -lne "print \"create refs/remotes/$r/tags/\$. \$_\"" <in |
+			sed "s|\(.*\)|create refs/remotes/$r/tags/\1 \1" in |
 			git update-ref --stdin || return 1
 		done &&
 
@@ -251,7 +250,7 @@ test_expect_success 'pseudo-merge pattern with capture groups' '
 		do
 			test_pseudo_merge_commits $m >oids &&
 			grep -f oids refs |
-			perl -lne "print \$1 if /refs\/remotes\/([0-9]+)/" |
+			sed -n "s|refs/remotes/\([0-9][0-9]*\)/|\1|p" &&
 			sort -u || return 1
 		done >remotes &&
 
@@ -386,6 +385,62 @@ test_expect_success 'pseudo-merge reuse' '
 
 		sort -u <unstable-oids.before >expect &&
 		sort -u <unstable-oids.after >actual &&
+		test_cmp expect actual
+	)
+'
+
+test_expect_success 'empty pseudo-merge group' '
+	git init pseudo-merge-empty-group &&
+	(
+		cd pseudo-merge-empty-group &&
+
+		# Ensure that a pseudo-merge group with no unstable
+		# commits does not generate an empty pseudo-merge
+		# bitmap.
+		git config bitmapPseudoMerge.empty.pattern refs/ &&
+
+		test_commit base &&
+		git repack -adb &&
+
+		test-tool bitmap dump-pseudo-merges >merges &&
+		test_line_count = 1 merges &&
+
+		test 0 -eq "$(grep -c commits=0 <merges)"
+	)
+'
+
+test_expect_success 'pseudo-merge closure' '
+	git init pseudo-merge-closure &&
+	(
+		cd pseudo-merge-closure &&
+
+		test_commit A &&
+		git repack -d &&
+
+		test_commit B &&
+
+		# Note that the contents of A is packed, but B is not. A
+		# (and the objects reachable from it) are thus visible
+		# to the MIDX, but the same is not true for B and its
+		# objects.
+		#
+		# Ensure that we do not attempt to create a pseudo-merge
+		# for B, depsite it matching the below pseudo-merge
+		# group pattern, as doing so would result in a failure
+		# to write a non-closed bitmap.
+		git config bitmapPseudoMerge.test.pattern refs/ &&
+		git config bitmapPseudoMerge.test.threshold now &&
+
+		git multi-pack-index write --bitmap &&
+
+		test-tool bitmap dump-pseudo-merges >pseudo-merges &&
+		test_line_count = 1 pseudo-merges &&
+
+		git rev-parse A >expect &&
+
+		test-tool bitmap list-commits >actual &&
+		test_cmp expect actual &&
+		test-tool bitmap dump-pseudo-merge-commits 0 >actual &&
 		test_cmp expect actual
 	)
 '

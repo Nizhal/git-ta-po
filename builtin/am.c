@@ -4,6 +4,8 @@
  * Based on git-am.sh by Junio C Hamano.
  */
 
+#define USE_THE_REPOSITORY_VARIABLE
+
 #include "builtin.h"
 #include "abspath.h"
 #include "advice.h"
@@ -29,7 +31,7 @@
 #include "preload-index.h"
 #include "sequencer.h"
 #include "revision.h"
-#include "merge-recursive.h"
+#include "merge-ort-wrappers.h"
 #include "log-tree.h"
 #include "notes-utils.h"
 #include "rerere.h"
@@ -38,7 +40,6 @@
 #include "string-list.h"
 #include "pager.h"
 #include "path.h"
-#include "repository.h"
 #include "pretty.h"
 
 /**
@@ -157,7 +158,7 @@ static void am_state_init(struct am_state *state)
 
 	memset(state, 0, sizeof(*state));
 
-	state->dir = git_pathdup("rebase-apply");
+	state->dir = repo_git_path(the_repository, "rebase-apply");
 
 	state->prec = 4;
 
@@ -490,7 +491,8 @@ static int run_applypatch_msg_hook(struct am_state *state)
 	assert(state->msg);
 
 	if (!state->no_verify)
-		ret = run_hooks_l("applypatch-msg", am_path(state, "final-commit"), NULL);
+		ret = run_hooks_l(the_repository, "applypatch-msg",
+				  am_path(state, "final-commit"), NULL);
 
 	if (!ret) {
 		FREE_AND_NULL(state->msg);
@@ -512,7 +514,7 @@ static int run_post_rewrite_hook(const struct am_state *state)
 	strvec_push(&opt.args, "rebase");
 	opt.path_to_stdin = am_path(state, "rewritten");
 
-	return run_hooks_opt("post-rewrite", &opt);
+	return run_hooks_opt(the_repository, "post-rewrite", &opt);
 }
 
 /**
@@ -848,8 +850,10 @@ static int split_mail_stgit_series(struct am_state *state, const char **paths,
 	series_dir = dirname(series_dir_buf);
 
 	fp = fopen(*paths, "r");
-	if (!fp)
+	if (!fp) {
+		free(series_dir_buf);
 		return error_errno(_("could not open '%s' for reading"), *paths);
+	}
 
 	while (!strbuf_getline_lf(&sb, fp)) {
 		if (*sb.buf == '#')
@@ -1209,7 +1213,7 @@ static int parse_mail(struct am_state *state, const char *mail)
 	int ret = 0;
 	struct mailinfo mi;
 
-	setup_mailinfo(&mi);
+	setup_mailinfo(the_repository, &mi);
 
 	if (state->utf8)
 		mi.metainfo_charset = get_commit_output_encoding();
@@ -1543,7 +1547,8 @@ static int run_apply(const struct am_state *state, const char *index_file)
 	if (index_file) {
 		/* Reload index as apply_all_patches() will have modified it. */
 		discard_index(the_repository->index);
-		read_index_from(the_repository->index, index_file, get_git_dir());
+		read_index_from(the_repository->index, index_file,
+				repo_get_git_dir(the_repository));
 	}
 
 	return 0;
@@ -1586,7 +1591,7 @@ static int fall_back_threeway(const struct am_state *state, const char *index_pa
 		return error("could not build fake ancestor");
 
 	discard_index(the_repository->index);
-	read_index_from(the_repository->index, index_path, get_git_dir());
+	read_index_from(the_repository->index, index_path, repo_get_git_dir(the_repository));
 
 	if (write_index_as_tree(&bases[0], the_repository->index, index_path, 0, NULL))
 		return error(_("Repository lacks necessary blobs to fall back on 3-way merge."));
@@ -1630,17 +1635,18 @@ static int fall_back_threeway(const struct am_state *state, const char *index_pa
 	 * changes.
 	 */
 
-	init_merge_options(&o, the_repository);
+	init_ui_merge_options(&o, the_repository);
 
 	o.branch1 = "HEAD";
 	their_tree_name = xstrfmt("%.*s", linelen(state->msg), state->msg);
 	o.branch2 = their_tree_name;
+	o.ancestor = "constructed fake ancestor";
 	o.detect_directory_renames = MERGE_DIRECTORY_RENAMES_NONE;
 
 	if (state->quiet)
 		o.verbosity = 0;
 
-	if (merge_recursive_generic(&o, &our_tree, &their_tree, 1, bases, &result)) {
+	if (merge_ort_generic(&o, &our_tree, &their_tree, 1, bases, &result)) {
 		repo_rerere(the_repository, state->allow_rerere_autoupdate);
 		free(their_tree_name);
 		return error(_("Failed to merge in the changes."));
@@ -1663,10 +1669,12 @@ static void do_commit(const struct am_state *state)
 	const char *reflog_msg, *author, *committer = NULL;
 	struct strbuf sb = STRBUF_INIT;
 
-	if (!state->no_verify && run_hooks("pre-applypatch"))
+	if (!state->no_verify && run_hooks(the_repository, "pre-applypatch"))
 		exit(1);
 
-	if (write_index_as_tree(&tree, the_repository->index, get_index_file(), 0, NULL))
+	if (write_index_as_tree(&tree, the_repository->index,
+				repo_get_index_file(the_repository),
+				0, NULL))
 		die(_("git write-tree failed to write a tree"));
 
 	if (!repo_get_oid_commit(the_repository, "HEAD", &parent)) {
@@ -1716,7 +1724,7 @@ static void do_commit(const struct am_state *state)
 		fclose(fp);
 	}
 
-	run_hooks("post-applypatch");
+	run_hooks(the_repository, "post-applypatch");
 
 	free_commit_list(parents);
 	strbuf_release(&sb);
@@ -1781,7 +1789,7 @@ static int do_interactive(struct am_state *state)
 			}
 			strbuf_release(&msg);
 		} else if (*reply == 'v' || *reply == 'V') {
-			const char *pager = git_pager(1);
+			const char *pager = git_pager(the_repository, 1);
 			struct child_process cp = CHILD_PROCESS_INIT;
 
 			if (!pager)
@@ -2076,7 +2084,9 @@ static int clean_index(const struct object_id *head, const struct object_id *rem
 	if (fast_forward_to(head_tree, head_tree, 1))
 		return -1;
 
-	if (write_index_as_tree(&index, the_repository->index, get_index_file(), 0, NULL))
+	if (write_index_as_tree(&index, the_repository->index,
+				repo_get_index_file(the_repository),
+				0, NULL))
 		return -1;
 
 	index_tree = parse_tree_indirect(&index);
@@ -2239,7 +2249,7 @@ static int show_patch(struct am_state *state, enum resume_type resume_mode)
 	if (len < 0)
 		die_errno(_("failed to read '%s'"), patch_path);
 
-	setup_pager();
+	setup_pager(the_repository);
 	write_in_full(1, sb.buf, sb.len);
 	strbuf_release(&sb);
 	return 0;
@@ -2297,7 +2307,10 @@ static int parse_opt_show_current_patch(const struct option *opt, const char *ar
 	return 0;
 }
 
-int cmd_am(int argc, const char **argv, const char *prefix)
+int cmd_am(int argc,
+	   const char **argv,
+	   const char *prefix,
+	   struct repository *repo UNUSED)
 {
 	struct am_state state;
 	int binary = -1;
@@ -2389,11 +2402,16 @@ int cmd_am(int argc, const char **argv, const char *prefix)
 		OPT_CMDMODE(0, "quit", &resume_mode,
 			N_("abort the patching operation but keep HEAD where it is"),
 			RESUME_QUIT),
-		{ OPTION_CALLBACK, 0, "show-current-patch", &resume_mode,
-		  "(diff|raw)",
-		  N_("show the patch being applied"),
-		  PARSE_OPT_CMDMODE | PARSE_OPT_OPTARG | PARSE_OPT_NONEG | PARSE_OPT_LITERAL_ARGHELP,
-		  parse_opt_show_current_patch, RESUME_SHOW_PATCH_RAW },
+		{
+			.type = OPTION_CALLBACK,
+			.long_name = "show-current-patch",
+			.value = &resume_mode,
+			.argh = "(diff|raw)",
+			.help = N_("show the patch being applied"),
+			.flags = PARSE_OPT_CMDMODE | PARSE_OPT_OPTARG | PARSE_OPT_NONEG | PARSE_OPT_LITERAL_ARGHELP,
+			.callback = parse_opt_show_current_patch,
+			.defval = RESUME_SHOW_PATCH_RAW,
+		},
 		OPT_CMDMODE(0, "retry", &resume_mode,
 			N_("try to apply current patch again"),
 			RESUME_APPLY),
@@ -2406,9 +2424,16 @@ int cmd_am(int argc, const char **argv, const char *prefix)
 		OPT_BOOL(0, "ignore-date", &state.ignore_date,
 			N_("use current timestamp for author date")),
 		OPT_RERERE_AUTOUPDATE(&state.allow_rerere_autoupdate),
-		{ OPTION_STRING, 'S', "gpg-sign", &state.sign_commit, N_("key-id"),
-		  N_("GPG-sign commits"),
-		  PARSE_OPT_OPTARG, NULL, (intptr_t) "" },
+		{
+			.type = OPTION_STRING,
+			.short_name = 'S',
+			.long_name = "gpg-sign",
+			.value = &state.sign_commit,
+			.argh = N_("key-id"),
+			.help = N_("GPG-sign commits"),
+			.flags = PARSE_OPT_OPTARG,
+			.defval = (intptr_t) "",
+		},
 		OPT_CALLBACK_F(0, "empty", &state.empty_type, "(stop|drop|keep)",
 		  N_("how to handle empty patches"),
 		  PARSE_OPT_NONEG, am_option_parse_empty),
@@ -2417,8 +2442,7 @@ int cmd_am(int argc, const char **argv, const char *prefix)
 		OPT_END()
 	};
 
-	if (argc == 2 && !strcmp(argv[1], "-h"))
-		usage_with_options(usage, options);
+	show_usage_with_options_if_asked(argc, argv, usage, options);
 
 	git_config(git_default_config, NULL);
 

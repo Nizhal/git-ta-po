@@ -1,6 +1,6 @@
+#define USE_THE_REPOSITORY_VARIABLE
 #include "builtin.h"
 #include "gettext.h"
-#include "repository.h"
 #include "hash.h"
 #include "apply.h"
 
@@ -9,7 +9,10 @@ static const char * const apply_usage[] = {
 	NULL
 };
 
-int cmd_apply(int argc, const char **argv, const char *prefix)
+int cmd_apply(int argc,
+	      const char **argv,
+	      const char *prefix,
+	      struct repository *repo)
 {
 	int force_apply = 0;
 	int options = 0;
@@ -31,6 +34,11 @@ int cmd_apply(int argc, const char **argv, const char *prefix)
 	argc = apply_parse_options(argc, argv,
 				   &state, &force_apply, &options,
 				   apply_usage);
+
+	if (repo) {
+		prepare_repo_settings(repo);
+		repo->settings.command_requires_full_index = 0;
+	}
 
 	if (check_apply_state(&state, force_apply))
 		exit(128);

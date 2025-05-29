@@ -16,7 +16,7 @@
 #    and second line is the subject of the message.
 #
 
-use 5.008001;
+require v5.26;
 use strict;
 use warnings $ENV{GIT_PERL_FATAL_WARNINGS} ? qw(FATAL all) : ();
 use Getopt::Long;
@@ -31,6 +31,7 @@ sub usage {
 git send-email [<options>] <file|directory>
 git send-email [<options>] <format-patch options>
 git send-email --dump-aliases
+git send-email --translate-aliases
 
   Composing:
     --from                  <str>  * Email From:
@@ -40,12 +41,16 @@ git send-email --dump-aliases
     --subject               <str>  * Email "Subject:"
     --reply-to              <str>  * Email "Reply-To:"
     --in-reply-to           <str>  * Email "In-Reply-To:"
+    --[no-]outlook-id-fix          * The SMTP host is an Outlook server that munges the
+                                     Message-ID. Retrieve it from the server.
     --[no-]xmailer                 * Add "X-Mailer:" header (default).
     --[no-]annotate                * Review each patch that will be sent in an editor.
     --compose                      * Open an editor for introduction.
     --compose-encoding      <str>  * Encoding to assume for introduction.
     --8bit-encoding         <str>  * Encoding to assume 8bit mails if undeclared
     --transfer-encoding     <str>  * Transfer encoding to use (quoted-printable, 8bit, base64)
+    --[no-]mailmap                 * Use mailmap file to map all email addresses to canonical
+                                     real names and email addresses.
 
   Sending:
     --envelope-sender       <str>  * Email envelope sender.
@@ -65,7 +70,7 @@ git send-email --dump-aliases
     --smtp-auth             <str>  * Space-separated list of allowed AUTH mechanisms, or
                                      "none" to disable authentication.
                                      This setting forces to use one of the listed mechanisms.
-    --no-smtp-auth                   Disable SMTP authentication. Shorthand for
+    --no-smtp-auth                 * Disable SMTP authentication. Shorthand for
                                      `--smtp-auth=none`
     --smtp-debug            <0|1>  * Disable, enable Net::SMTP debug.
 
@@ -99,6 +104,10 @@ git send-email --dump-aliases
 
   Information:
     --dump-aliases                 * Dump configured aliases and exit.
+    --translate-aliases            * Translate aliases read from standard
+                                     input according to the configured email
+                                     alias file(s), outputting the result to
+                                     standard output.
 
 EOT
 	exit(1);
@@ -212,6 +221,7 @@ my $format_patch;
 my $compose_filename;
 my $force = 0;
 my $dump_aliases = 0;
+my $translate_aliases = 0;
 
 # Variables to prevent short format-patch options from being captured
 # as abbreviated send-email options
@@ -272,14 +282,17 @@ my (@suppress_cc);
 my ($auto_8bit_encoding);
 my ($compose_encoding);
 my ($sendmail_cmd);
+my ($mailmap_file, $mailmap_blob);
 # Variables with corresponding config settings & hardcoded defaults
 my ($debug_net_smtp) = 0;		# Net::SMTP, see send_message()
 my $thread = 1;
 my $chain_reply_to = 0;
 my $use_xmailer = 1;
 my $validate = 1;
+my $mailmap = 0;
 my $target_xfer_encoding = 'auto';
 my $forbid_sendmail_variables = 1;
+my $outlook_id_fix = 'auto';
 
 my %config_bool_settings = (
     "thread" => \$thread,
@@ -294,6 +307,8 @@ my %config_bool_settings = (
     "annotate" => \$annotate,
     "xmailer" => \$use_xmailer,
     "forbidsendmailvariables" => \$forbid_sendmail_variables,
+    "mailmap" => \$mailmap,
+    "outlookidfix" => \$outlook_id_fix,
 );
 
 my %config_settings = (
@@ -327,6 +342,8 @@ my %config_settings = (
 my %config_path_settings = (
     "aliasesfile" => \@alias_files,
     "smtpsslcertpath" => \$smtp_ssl_cert_path,
+    "mailmap.file" => \$mailmap_file,
+    "mailmap.blob" => \$mailmap_blob,
 );
 
 # Handle Uncouth Termination
@@ -476,11 +493,14 @@ my $git_completion_helper;
 my %dump_aliases_options = (
 	"h" => \$help,
 	"dump-aliases" => \$dump_aliases,
+	"translate-aliases" => \$translate_aliases,
 );
 $rc = GetOptions(%dump_aliases_options);
 usage() unless $rc;
 die __("--dump-aliases incompatible with other options\n")
-    if !$help and $dump_aliases and @ARGV;
+    if !$help and ($dump_aliases or $translate_aliases) and @ARGV;
+die __("--dump-aliases and --translate-aliases are mutually exclusive\n")
+    if !$help and $dump_aliases and $translate_aliases;
 my %options = (
 		    "sender|from=s" => \$sender,
 		    "in-reply-to=s" => \$initial_in_reply_to,
@@ -524,6 +544,8 @@ my %options = (
 		    "thread!" => \$thread,
 		    "validate!" => \$validate,
 		    "transfer-encoding=s" => \$target_xfer_encoding,
+		    "mailmap!" => \$mailmap,
+		    "use-mailmap!" => \$mailmap,
 		    "format-patch!" => \$format_patch,
 		    "8bit-encoding=s" => \$auto_8bit_encoding,
 		    "compose-encoding=s" => \$compose_encoding,
@@ -533,6 +555,7 @@ my %options = (
 		    "relogin-delay=i" => \$relogin_delay,
 		    "git-completion-helper" => \$git_completion_helper,
 		    "v=s" => \$reroll_count,
+		    "outlook-id-fix!" => \$outlook_id_fix,
 );
 $rc = GetOptions(%options);
 
@@ -722,6 +745,16 @@ if (@alias_files and $aliasfiletype and defined $parse_alias{$aliasfiletype}) {
 if ($dump_aliases) {
     print "$_\n" for (sort keys %aliases);
     exit(0);
+}
+
+if ($translate_aliases) {
+	while (<STDIN>) {
+		my @addr_list = parse_address_line($_);
+		@addr_list = expand_aliases(@addr_list);
+		@addr_list = sanitize_address_list(@addr_list);
+		print "$_\n" for @addr_list;
+	}
+	exit(0);
 }
 
 # is_format_patch_arg($f) returns 0 if $f names a patch, or 1 if
@@ -1085,6 +1118,16 @@ if ($compose && $compose > 0) {
 our ($message_id, %mail, $subject, $in_reply_to, $references, $message,
 	$needs_confirm, $message_num, $ask_default);
 
+sub mailmap_address_list {
+	return @_ unless @_ and $mailmap;
+	my @options = ();
+	push(@options, "--mailmap-file=$mailmap_file") if $mailmap_file;
+	push(@options, "--mailmap-blob=$mailmap_blob") if $mailmap_blob;
+	my @addr_list = Git::command('check-mailmap', @options, @_);
+	s/^<(.*)>$/$1/ for @addr_list;
+	return @addr_list;
+}
+
 sub extract_valid_address {
 	my $address = shift;
 	my $local_part_regexp = qr/[^<>"\s@]+/;
@@ -1294,6 +1337,7 @@ sub process_address_list {
 	@addr_list = expand_aliases(@addr_list);
 	@addr_list = sanitize_address_list(@addr_list);
 	@addr_list = validate_address_list(@addr_list);
+	@addr_list = mailmap_address_list(@addr_list);
 	return @addr_list;
 }
 
@@ -1315,7 +1359,9 @@ sub process_address_list {
 
 sub valid_fqdn {
 	my $domain = shift;
-	return defined $domain && !($^O eq 'darwin' && $domain =~ /\.local$/) && $domain =~ /\./;
+	my $subdomain = '(?!-)[A-Za-z0-9-]{1,63}(?<!-)';
+	return defined $domain && !($^O eq 'darwin' && $domain =~ /\.local$/)
+		&& $domain  =~ /^$subdomain(?:\.$subdomain)*$/;
 }
 
 sub maildomain_net {
@@ -1347,8 +1393,22 @@ sub maildomain_mta {
 	return $maildomain;
 }
 
+sub maildomain_hostname_command {
+	my $maildomain;
+
+	if ($^O eq 'linux' || $^O eq 'darwin') {
+		my $domain = `(hostname -f) 2>/dev/null`;
+		if (!$?) {
+			chomp($domain);
+			$maildomain = $domain if valid_fqdn($domain);
+		}
+	}
+	return $maildomain;
+}
+
 sub maildomain {
-	return maildomain_net() || maildomain_mta() || 'localhost.localdomain';
+	return maildomain_net() || maildomain_mta() ||
+		maildomain_hostname_command || 'localhost.localdomain';
 }
 
 sub smtp_host_string {
@@ -1380,7 +1440,7 @@ sub smtp_auth_maybe {
 		die "invalid smtp auth: '${smtp_auth}'";
 	}
 
-	# TODO: Authentication may fail not because credentials were
+	# Authentication may fail not because credentials were
 	# invalid but due to other reasons, in which we should not
 	# reject credentials.
 	$auth = Git::credential({
@@ -1392,24 +1452,61 @@ sub smtp_auth_maybe {
 		'password' => $smtp_authpass
 	}, sub {
 		my $cred = shift;
+		my $result;
+		my $error;
 
-		if ($smtp_auth) {
-			my $sasl = Authen::SASL->new(
-				mechanism => $smtp_auth,
-				callback => {
-					user => $cred->{'username'},
-					pass => $cred->{'password'},
-					authname => $cred->{'username'},
-				}
-			);
+		# catch all SMTP auth error in a unified eval block
+		eval {
+			if ($smtp_auth) {
+				my $sasl = Authen::SASL->new(
+					mechanism => $smtp_auth,
+					callback => {
+						user     => $cred->{'username'},
+						pass     => $cred->{'password'},
+						authname => $cred->{'username'},
+					}
+				);
+				$result = $smtp->auth($sasl);
+			} else {
+				$result = $smtp->auth($cred->{'username'}, $cred->{'password'});
+			}
+			1; # ensure true value is returned if no exception is thrown
+		} or do {
+			$error = $@ || 'Unknown error';
+		};
 
-			return !!$smtp->auth($sasl);
-		}
-
-		return !!$smtp->auth($cred->{'username'}, $cred->{'password'});
+		return ($error
+			? handle_smtp_error($error)
+			: ($result ? 1 : 0));
 	});
 
 	return $auth;
+}
+
+sub handle_smtp_error {
+	my ($error) = @_;
+
+	# Parse SMTP status code from error message in:
+	# https://www.rfc-editor.org/rfc/rfc5321.html
+	if ($error =~ /\b(\d{3})\b/) {
+		my $status_code = $1;
+		if ($status_code =~ /^4/) {
+			# 4yz: Transient Negative Completion reply
+			warn "SMTP transient error (status code $status_code): $error";
+			return 1;
+		} elsif ($status_code =~ /^5/) {
+			# 5yz: Permanent Negative Completion reply
+			warn "SMTP permanent error (status code $status_code): $error";
+			return 0;
+		}
+		# If no recognized status code is found, treat as transient error
+		warn "SMTP unknown error: $error. Treating as transient failure.";
+		return 1;
+	}
+
+	# If no status code is found, treat as transient error
+	warn "SMTP generic error: $error";
+	return 1;
 }
 
 sub ssl_verify_params {
@@ -1462,7 +1559,7 @@ sub gen_header {
 	@recipients = unique_email_list(@recipients,@cc,@initial_bcc);
 	@recipients = (map { extract_valid_address_or_die($_) } @recipients);
 	my $date = format_2822_time($time++);
-	my $gitversion = '@@GIT_VERSION@@';
+	my $gitversion = '@GIT_VERSION@';
 	if ($gitversion =~ m/..GIT_VERSION../) {
 	    $gitversion = Git::version();
 	}
@@ -1496,6 +1593,16 @@ Message-ID: $message_id
 	}
 	my $recipients_ref = \@recipients;
 	return ($recipients_ref, $to, $date, $gitversion, $cc, $ccline, $header);
+}
+
+sub is_outlook {
+	my ($host) = @_;
+	if ($outlook_id_fix eq 'auto') {
+		$outlook_id_fix =
+			($host eq 'smtp.office365.com' ||
+			 $host eq 'smtp-mail.outlook.com') ? 1 : 0;
+	}
+	return $outlook_id_fix;
 }
 
 # Prepares the email, then asks the user what to do.
@@ -1661,6 +1768,22 @@ EOF
 			$smtp->datasend("$line") or die $smtp->message;
 		}
 		$smtp->dataend() or die $smtp->message;
+
+		# Outlook discards the Message-ID header we set while sending the email
+		# and generates a new random Message-ID. So in order to avoid breaking
+		# threads, we simply retrieve the Message-ID from the server response
+		# and assign it to the $message_id variable, which will then be
+		# assigned to $in_reply_to by the caller when the next message is sent
+		# as a response to this message.
+		if (is_outlook($smtp_server)) {
+			if ($smtp->message =~ /<([^>]+)>/) {
+				$message_id = "<$1>";
+				printf __("Outlook reassigned Message-ID to: %s\n"), $message_id;
+			} else {
+				warn __("Warning: Could not retrieve Message-ID from server response.\n");
+			}
+		}
+
 		$smtp->code =~ /250|200/ or die sprintf(__("Failed to send %s\n"), $subject).$smtp->message;
 	}
 	if ($quiet) {

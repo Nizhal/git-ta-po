@@ -6,7 +6,11 @@
  * Based on git-merge.sh by Junio C Hamano.
  */
 
+#define USE_THE_REPOSITORY_VARIABLE
+#define DISABLE_SIGN_COMPARE_WARNINGS
+
 #include "builtin.h"
+
 #include "abspath.h"
 #include "advice.h"
 #include "config.h"
@@ -17,6 +21,7 @@
 #include "object-name.h"
 #include "parse-options.h"
 #include "lockfile.h"
+#include "repository.h"
 #include "run-command.h"
 #include "hook.h"
 #include "diff.h"
@@ -34,7 +39,6 @@
 #include "rerere.h"
 #include "help.h"
 #include "merge.h"
-#include "merge-recursive.h"
 #include "merge-ort-wrappers.h"
 #include "resolve-undo.h"
 #include "remote.h"
@@ -166,7 +170,7 @@ static struct strategy *get_strategy(const char *name)
 	struct strategy *ret;
 	static struct cmdnames main_cmds = {0}, other_cmds = {0};
 	static int loaded;
-	char *default_strategy = getenv("GIT_TEST_MERGE_ALGORITHM");
+	char *default_strategy = NULL;
 
 	if (!name)
 		return NULL;
@@ -245,9 +249,16 @@ static struct option builtin_merge_options[] = {
 	OPT_BOOL(0, "stat", &show_diffstat,
 		N_("show a diffstat at the end of the merge")),
 	OPT_BOOL(0, "summary", &show_diffstat, N_("(synonym to --stat)")),
-	{ OPTION_INTEGER, 0, "log", &shortlog_len, N_("n"),
-	  N_("add (at most <n>) entries from shortlog to merge commit message"),
-	  PARSE_OPT_OPTARG, NULL, DEFAULT_MERGE_LOG_LEN },
+	{
+		.type = OPTION_INTEGER,
+		.long_name = "log",
+		.value = &shortlog_len,
+		.precision = sizeof(shortlog_len),
+		.argh = N_("n"),
+		.help = N_("add (at most <n>) entries from shortlog to merge commit message"),
+		.flags = PARSE_OPT_OPTARG,
+		.defval = DEFAULT_MERGE_LOG_LEN,
+	},
 	OPT_BOOL(0, "squash", &squash,
 		N_("create a single commit instead of doing a merge")),
 	OPT_BOOL(0, "commit", &option_commit,
@@ -269,9 +280,16 @@ static struct option builtin_merge_options[] = {
 	OPT_CALLBACK('m', "message", &merge_msg, N_("message"),
 		N_("merge commit message (for a non-fast-forward merge)"),
 		option_parse_message),
-	{ OPTION_LOWLEVEL_CALLBACK, 'F', "file", &merge_msg, N_("path"),
-		N_("read message from file"), PARSE_OPT_NONEG,
-		NULL, 0, option_read_message },
+	{
+		.type = OPTION_LOWLEVEL_CALLBACK,
+		.short_name = 'F',
+		.long_name = "file",
+		.value = &merge_msg,
+		.argh = N_("path"),
+		.help = N_("read message from file"),
+		.flags = PARSE_OPT_NONEG,
+		.ll_callback = option_read_message,
+	},
 	OPT_STRING(0, "into-name", &into_name, N_("name"),
 		   N_("use <name> instead of the real target")),
 	OPT__VERBOSITY(&verbosity),
@@ -284,8 +302,16 @@ static struct option builtin_merge_options[] = {
 	OPT_BOOL(0, "allow-unrelated-histories", &allow_unrelated_histories,
 		 N_("allow merging unrelated histories")),
 	OPT_SET_INT(0, "progress", &show_progress, N_("force progress reporting"), 1),
-	{ OPTION_STRING, 'S', "gpg-sign", &sign_commit, N_("key-id"),
-	  N_("GPG sign commit"), PARSE_OPT_OPTARG, NULL, (intptr_t) "" },
+	{
+		.type = OPTION_STRING,
+		.short_name = 'S',
+		.long_name = "gpg-sign",
+		.value = &sign_commit,
+		.argh = N_("key-id"),
+		.help = N_("GPG sign commit"),
+		.flags = PARSE_OPT_OPTARG,
+		.defval = (intptr_t) "",
+	},
 	OPT_AUTOSTASH(&autostash),
 	OPT_BOOL(0, "overwrite-ignore", &overwrite_ignore, N_("update ignored files (default)")),
 	OPT_BOOL(0, "signoff", &signoff, N_("add a Signed-off-by trailer")),
@@ -478,7 +504,7 @@ static void finish(struct commit *head_commit,
 	}
 
 	/* Run a post-merge hook */
-	run_hooks_l("post-merge", squash ? "1" : "0", NULL);
+	run_hooks_l(the_repository, "post-merge", squash ? "1" : "0", NULL);
 
 	if (new_head)
 		apply_autostash_ref(the_repository, "MERGE_AUTOSTASH");
@@ -496,7 +522,7 @@ static void merge_name(const char *remote, struct strbuf *msg)
 	char *found_ref = NULL;
 	int len, early;
 
-	strbuf_branchname(&bname, remote, 0);
+	copy_branchname(&bname, remote, 0);
 	remote = bname.buf;
 
 	oidclr(&branch_head, the_repository->hash_algo);
@@ -695,7 +721,9 @@ static int read_tree_trivial(struct object_id *common, struct object_id *head,
 
 static void write_tree_trivial(struct object_id *oid)
 {
-	if (write_index_as_tree(oid, the_repository->index, get_index_file(), 0, NULL))
+	if (write_index_as_tree(oid, the_repository->index,
+				repo_get_index_file(the_repository),
+				0, NULL))
 		die(_("git write-tree failed to write a tree"));
 }
 
@@ -724,7 +752,7 @@ static int try_merge_strategy(const char *strategy, struct commit_list *common,
 			return 2;
 		}
 
-		init_merge_options(&o, the_repository);
+		init_ui_merge_options(&o, the_repository);
 		if (!strcmp(strategy, "subtree"))
 			o.subtree_shift = "";
 
@@ -743,13 +771,10 @@ static int try_merge_strategy(const char *strategy, struct commit_list *common,
 
 		repo_hold_locked_index(the_repository, &lock,
 				       LOCK_DIE_ON_ERROR);
-		if (!strcmp(strategy, "ort"))
-			clean = merge_ort_recursive(&o, head, remoteheads->item,
-						    reversed, &result);
-		else
-			clean = merge_recursive(&o, head, remoteheads->item,
-						reversed, &result);
+		clean = merge_ort_recursive(&o, head, remoteheads->item,
+					    reversed, &result);
 		free_commit_list(reversed);
+		strbuf_release(&o.obuf);
 
 		if (clean < 0) {
 			rollback_lock_file(&lock);
@@ -757,7 +782,7 @@ static int try_merge_strategy(const char *strategy, struct commit_list *common,
 		}
 		if (write_locked_index(the_repository->index, &lock,
 				       COMMIT_LOCK | SKIP_IF_UNCHANGED))
-			die(_("unable to write %s"), get_index_file());
+			die(_("unable to write %s"), repo_get_index_file(the_repository));
 		return clean ? 0 : 1;
 	} else {
 		return try_merge_command(the_repository,
@@ -839,7 +864,7 @@ static void write_merge_heads(struct commit_list *);
 static void prepare_to_commit(struct commit_list *remoteheads)
 {
 	struct strbuf msg = STRBUF_INIT;
-	const char *index_file = get_index_file();
+	const char *index_file = repo_get_index_file(the_repository);
 
 	if (!no_verify) {
 		int invoked_hook;
@@ -855,7 +880,8 @@ static void prepare_to_commit(struct commit_list *remoteheads)
 		if (invoked_hook)
 			discard_index(the_repository->index);
 	}
-	read_index_from(the_repository->index, index_file, get_git_dir());
+	read_index_from(the_repository->index, index_file,
+			repo_get_git_dir(the_repository));
 	strbuf_addbuf(&msg, &merge_msg);
 	if (squash)
 		BUG("the control must not reach here under --squash");
@@ -878,8 +904,8 @@ static void prepare_to_commit(struct commit_list *remoteheads)
 		append_signoff(&msg, ignored_log_message_bytes(msg.buf, msg.len), 0);
 	write_merge_heads(remoteheads);
 	write_file_buf(git_path_merge_msg(the_repository), msg.buf, msg.len);
-	if (run_commit_hook(0 < option_edit, get_index_file(), NULL,
-			    "prepare-commit-msg",
+	if (run_commit_hook(0 < option_edit, repo_get_index_file(the_repository),
+			    NULL, "prepare-commit-msg",
 			    git_path_merge_msg(the_repository), "merge", NULL))
 		abort_commit(remoteheads, NULL);
 	if (0 < option_edit) {
@@ -887,7 +913,7 @@ static void prepare_to_commit(struct commit_list *remoteheads)
 			abort_commit(remoteheads, NULL);
 	}
 
-	if (!no_verify && run_commit_hook(0 < option_edit, get_index_file(),
+	if (!no_verify && run_commit_hook(0 < option_edit, repo_get_index_file(the_repository),
 					  NULL, "commit-msg",
 					  git_path_merge_msg(the_repository), NULL))
 		abort_commit(remoteheads, NULL);
@@ -1275,7 +1301,10 @@ static int merging_a_throwaway_tag(struct commit *commit)
 	return is_throwaway_tag;
 }
 
-int cmd_merge(int argc, const char **argv, const char *prefix)
+int cmd_merge(int argc,
+	      const char **argv,
+	      const char *prefix,
+	      struct repository *repo UNUSED)
 {
 	struct object_id result_tree, stash, head_oid;
 	struct commit *head_commit;
@@ -1288,8 +1317,8 @@ int cmd_merge(int argc, const char **argv, const char *prefix)
 	void *branch_to_free;
 	int orig_argc = argc;
 
-	if (argc == 2 && !strcmp(argv[1], "-h"))
-		usage_with_options(builtin_merge_usage, builtin_merge_options);
+	show_usage_with_options_if_asked(argc, argv,
+					 builtin_merge_usage, builtin_merge_options);
 
 	prepare_repo_settings(the_repository);
 	the_repository->settings.command_requires_full_index = 0;
@@ -1303,12 +1332,6 @@ int cmd_merge(int argc, const char **argv, const char *prefix)
 						      NULL);
 	if (branch)
 		skip_prefix(branch, "refs/heads/", &branch);
-
-	if (!pull_twohead) {
-		char *default_strategy = getenv("GIT_TEST_MERGE_ALGORITHM");
-		if (default_strategy && !strcmp(default_strategy, "ort"))
-			pull_twohead = xstrdup("ort");
-	}
 
 	init_diff_ui_defaults();
 	git_config(git_merge_config, NULL);
@@ -1347,7 +1370,7 @@ int cmd_merge(int argc, const char **argv, const char *prefix)
 					REF_NO_DEREF);
 
 		/* Invoke 'git reset --merge' */
-		ret = cmd_reset(nargc, nargv, prefix);
+		ret = cmd_reset(nargc, nargv, prefix, the_repository);
 
 		if (!is_null_oid(&stash_oid)) {
 			oid_to_hex_r(stash_oid_hex, &stash_oid);
@@ -1379,7 +1402,7 @@ int cmd_merge(int argc, const char **argv, const char *prefix)
 			die(_("There is no merge in progress (MERGE_HEAD missing)."));
 
 		/* Invoke 'git commit' */
-		ret = cmd_commit(nargc, nargv, prefix);
+		ret = cmd_commit(nargc, nargv, prefix, the_repository);
 		goto done;
 	}
 
@@ -1510,12 +1533,6 @@ int cmd_merge(int argc, const char **argv, const char *prefix)
 			fast_forward = FF_NO;
 	}
 
-	if (!use_strategies && !pull_twohead &&
-	    remoteheads && !remoteheads->next) {
-		char *default_strategy = getenv("GIT_TEST_MERGE_ALGORITHM");
-		if (default_strategy)
-			append_strategy(get_strategy(default_strategy));
-	}
 	if (!use_strategies) {
 		if (!remoteheads)
 			; /* already up-to-date */

@@ -8,6 +8,8 @@
  * Copyright (c) 2005, 2006 Linus Torvalds and Junio C Hamano
  */
 
+#define USE_THE_REPOSITORY_VARIABLE
+
 #include "builtin.h"
 #include "advice.h"
 #include "config.h"
@@ -26,6 +28,7 @@
 #include "object-name.h"
 #include "parse-options.h"
 #include "path.h"
+#include "repository.h"
 #include "unpack-trees.h"
 #include "cache-tree.h"
 #include "setup.h"
@@ -330,7 +333,10 @@ static int git_reset_config(const char *var, const char *value,
 	return git_default_config(var, value, ctx, cb);
 }
 
-int cmd_reset(int argc, const char **argv, const char *prefix)
+int cmd_reset(int argc,
+	      const char **argv,
+	      const char *prefix,
+	      struct repository *repo UNUSED)
 {
 	int reset_type = NONE, update_ref_status = 0, quiet = 0;
 	int no_refresh = 0;
@@ -414,6 +420,9 @@ int cmd_reset(int argc, const char **argv, const char *prefix)
 		oidcpy(&oid, &tree->object.oid);
 	}
 
+	prepare_repo_settings(the_repository);
+	the_repository->settings.command_requires_full_index = 0;
+
 	if (patch_mode) {
 		if (reset_type != NONE)
 			die(_("options '%s' and '%s' cannot be used together"), "--patch", "--{hard,mixed,soft}");
@@ -441,7 +450,7 @@ int cmd_reset(int argc, const char **argv, const char *prefix)
 	else
 		trace2_cmd_mode(reset_type_names[reset_type]);
 
-	if (reset_type != SOFT && (reset_type != MIXED || get_git_work_tree()))
+	if (reset_type != SOFT && (reset_type != MIXED || repo_get_work_tree(the_repository)))
 		setup_work_tree();
 
 	if (reset_type == MIXED && is_bare_repository())
@@ -450,9 +459,6 @@ int cmd_reset(int argc, const char **argv, const char *prefix)
 
 	if (intent_to_add && reset_type != MIXED)
 		die(_("the option '%s' requires '%s'"), "-N", "--mixed");
-
-	prepare_repo_settings(the_repository);
-	the_repository->settings.command_requires_full_index = 0;
 
 	if (repo_read_index(the_repository) < 0)
 		die(_("index file corrupt"));
@@ -474,7 +480,7 @@ int cmd_reset(int argc, const char **argv, const char *prefix)
 				goto cleanup;
 			}
 			the_repository->index->updated_skipworktree = 1;
-			if (!no_refresh && get_git_work_tree()) {
+			if (!no_refresh && repo_get_work_tree(the_repository)) {
 				uint64_t t_begin, t_delta_in_ms;
 
 				t_begin = getnanotime();

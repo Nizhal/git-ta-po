@@ -49,22 +49,47 @@ test_expect_success 'run [--auto|--quiet]' '
 		git maintenance run --auto 2>/dev/null &&
 	GIT_TRACE2_EVENT="$(pwd)/run-no-quiet.txt" \
 		git maintenance run --no-quiet 2>/dev/null &&
-	test_subcommand git gc --quiet <run-no-auto.txt &&
-	test_subcommand ! git gc --auto --quiet <run-auto.txt &&
-	test_subcommand git gc --no-quiet <run-no-quiet.txt
+	test_subcommand git gc --quiet --no-detach <run-no-auto.txt &&
+	test_subcommand ! git gc --auto --quiet --no-detach <run-auto.txt &&
+	test_subcommand git gc --no-quiet --no-detach <run-no-quiet.txt
 '
 
 test_expect_success 'maintenance.auto config option' '
 	GIT_TRACE2_EVENT="$(pwd)/default" git commit --quiet --allow-empty -m 1 &&
-	test_subcommand git maintenance run --auto --quiet <default &&
+	test_subcommand git maintenance run --auto --quiet --detach <default &&
 	GIT_TRACE2_EVENT="$(pwd)/true" \
 		git -c maintenance.auto=true \
 		commit --quiet --allow-empty -m 2 &&
-	test_subcommand git maintenance run --auto --quiet  <true &&
+	test_subcommand git maintenance run --auto --quiet --detach <true &&
 	GIT_TRACE2_EVENT="$(pwd)/false" \
 		git -c maintenance.auto=false \
 		commit --quiet --allow-empty -m 3 &&
-	test_subcommand ! git maintenance run --auto --quiet  <false
+	test_subcommand ! git maintenance run --auto --quiet --detach <false
+'
+
+for cfg in maintenance.autoDetach gc.autoDetach
+do
+	test_expect_success "$cfg=true config option" '
+		test_when_finished "rm -f trace" &&
+		test_config $cfg true &&
+		GIT_TRACE2_EVENT="$(pwd)/trace" git commit --quiet --allow-empty -m 1 &&
+		test_subcommand git maintenance run --auto --quiet --detach <trace
+	'
+
+	test_expect_success "$cfg=false config option" '
+		test_when_finished "rm -f trace" &&
+		test_config $cfg false &&
+		GIT_TRACE2_EVENT="$(pwd)/trace" git commit --quiet --allow-empty -m 1 &&
+		test_subcommand git maintenance run --auto --quiet --no-detach <trace
+	'
+done
+
+test_expect_success "maintenance.autoDetach overrides gc.autoDetach" '
+	test_when_finished "rm -f trace" &&
+	test_config maintenance.autoDetach false &&
+	test_config gc.autoDetach true &&
+	GIT_TRACE2_EVENT="$(pwd)/trace" git commit --quiet --allow-empty -m 1 &&
+	test_subcommand git maintenance run --auto --quiet --no-detach <trace
 '
 
 test_expect_success 'register uses XDG_CONFIG_HOME config if it exists' '
@@ -129,9 +154,9 @@ test_expect_success 'run --task=<task>' '
 		git maintenance run --task=commit-graph 2>/dev/null &&
 	GIT_TRACE2_EVENT="$(pwd)/run-both.txt" \
 		git maintenance run --task=commit-graph --task=gc 2>/dev/null &&
-	test_subcommand ! git gc --quiet <run-commit-graph.txt &&
-	test_subcommand git gc --quiet <run-gc.txt &&
-	test_subcommand git gc --quiet <run-both.txt &&
+	test_subcommand ! git gc --quiet --no-detach <run-commit-graph.txt &&
+	test_subcommand git gc --quiet --no-detach <run-gc.txt &&
+	test_subcommand git gc --quiet --no-detach <run-both.txt &&
 	test_subcommand git commit-graph write --split --reachable --no-progress <run-commit-graph.txt &&
 	test_subcommand ! git commit-graph write --split --reachable --no-progress <run-gc.txt &&
 	test_subcommand git commit-graph write --split --reachable --no-progress <run-both.txt
@@ -281,6 +306,34 @@ test_expect_success 'maintenance.loose-objects.auto' '
 	test_subcommand git prune-packed --quiet <trace-loC
 '
 
+test_expect_success 'maintenance.loose-objects.batchSize' '
+	git init loose-batch &&
+
+	# This creates three objects per commit.
+	test_commit_bulk -C loose-batch 34 &&
+	pack=$(ls loose-batch/.git/objects/pack/pack-*.pack) &&
+	index="${pack%pack}idx" &&
+	rm "$index" &&
+	git -C loose-batch unpack-objects <"$pack" &&
+	git -C loose-batch config maintenance.loose-objects.batchSize 50 &&
+
+	GIT_PROGRESS_DELAY=0 \
+	git -C loose-batch maintenance run --no-quiet --task=loose-objects 2>err &&
+	grep "Enumerating objects: 50, done." err &&
+
+	GIT_PROGRESS_DELAY=0 \
+	git -C loose-batch maintenance run --no-quiet --task=loose-objects 2>err &&
+	grep "Enumerating objects: 50, done." err &&
+
+	GIT_PROGRESS_DELAY=0 \
+	git -C loose-batch maintenance run --no-quiet --task=loose-objects 2>err &&
+	grep "Enumerating objects: 2, done." err &&
+
+	GIT_PROGRESS_DELAY=0 \
+	git -C loose-batch maintenance run --no-quiet --task=loose-objects 2>err &&
+	test_must_be_empty err
+'
+
 test_expect_success 'incremental-repack task' '
 	packDir=.git/objects/pack &&
 	for i in $(test_seq 1 5)
@@ -303,7 +356,8 @@ test_expect_success 'incremental-repack task' '
 
 	# Delete refs that have not been repacked in these packs.
 	git for-each-ref --format="delete %(refname)" \
-		refs/prefetch refs/tags refs/remotes >refs &&
+		refs/prefetch refs/tags refs/remotes \
+		--exclude=refs/remotes/*/HEAD >refs &&
 	git update-ref --stdin <refs &&
 
 	# Replace the object directory with this pack layout.
@@ -419,6 +473,139 @@ test_expect_success 'pack-refs task' '
 	GIT_TRACE2_EVENT="$(pwd)/pack-refs.txt" \
 		git maintenance run --task=pack-refs &&
 	test_subcommand git pack-refs --all --prune <pack-refs.txt
+'
+
+test_expect_success 'reflog-expire task' '
+	GIT_TRACE2_EVENT="$(pwd)/reflog-expire.txt" \
+		git maintenance run --task=reflog-expire &&
+	test_subcommand git reflog expire --all <reflog-expire.txt
+'
+
+test_expect_success 'reflog-expire task --auto only packs when exceeding limits' '
+	git reflog expire --all --expire=now &&
+	test_commit reflog-one &&
+	test_commit reflog-two &&
+	GIT_TRACE2_EVENT="$(pwd)/reflog-expire-auto.txt" \
+		git -c maintenance.reflog-expire.auto=3 maintenance run --auto --task=reflog-expire &&
+	test_subcommand ! git reflog expire --all <reflog-expire-auto.txt &&
+	GIT_TRACE2_EVENT="$(pwd)/reflog-expire-auto.txt" \
+		git -c maintenance.reflog-expire.auto=2 maintenance run --auto --task=reflog-expire &&
+	test_subcommand git reflog expire --all <reflog-expire-auto.txt
+'
+
+test_expect_worktree_prune () {
+	negate=
+	if test "$1" = "!"
+	then
+		negate="!"
+		shift
+	fi
+
+	rm -f "worktree-prune.txt" &&
+	GIT_TRACE2_EVENT="$(pwd)/worktree-prune.txt" "$@" &&
+	test_subcommand $negate git worktree prune --expire 3.months.ago <worktree-prune.txt
+}
+
+test_expect_success 'worktree-prune task without --auto always prunes' '
+	test_expect_worktree_prune git maintenance run --task=worktree-prune
+'
+
+test_expect_success 'worktree-prune task --auto only prunes with prunable worktree' '
+	test_expect_worktree_prune ! git maintenance run --auto --task=worktree-prune &&
+	mkdir .git/worktrees &&
+	: >.git/worktrees/abc &&
+	test_expect_worktree_prune git maintenance run --auto --task=worktree-prune
+'
+
+test_expect_success 'worktree-prune task with --auto honors maintenance.worktree-prune.auto' '
+	# A negative value should always prune.
+	test_expect_worktree_prune git -c maintenance.worktree-prune.auto=-1 maintenance run --auto --task=worktree-prune &&
+
+	mkdir .git/worktrees &&
+	: >.git/worktrees/first &&
+	: >.git/worktrees/second &&
+	: >.git/worktrees/third &&
+
+	# Zero should never prune.
+	test_expect_worktree_prune ! git -c maintenance.worktree-prune.auto=0 maintenance run --auto --task=worktree-prune &&
+	# A positive value should require at least this many prunable worktrees.
+	test_expect_worktree_prune ! git -c maintenance.worktree-prune.auto=4 maintenance run --auto --task=worktree-prune &&
+	test_expect_worktree_prune git -c maintenance.worktree-prune.auto=3 maintenance run --auto --task=worktree-prune
+'
+
+test_expect_success 'worktree-prune task with --auto honors maintenance.worktree-prune.auto' '
+	# A negative value should always prune.
+	test_expect_worktree_prune git -c maintenance.worktree-prune.auto=-1 maintenance run --auto --task=worktree-prune &&
+
+	mkdir .git/worktrees &&
+	: >.git/worktrees/first &&
+	: >.git/worktrees/second &&
+	: >.git/worktrees/third &&
+
+	# Zero should never prune.
+	test_expect_worktree_prune ! git -c maintenance.worktree-prune.auto=0 maintenance run --auto --task=worktree-prune &&
+	# A positive value should require at least this many prunable worktrees.
+	test_expect_worktree_prune ! git -c maintenance.worktree-prune.auto=4 maintenance run --auto --task=worktree-prune &&
+	test_expect_worktree_prune git -c maintenance.worktree-prune.auto=3 maintenance run --auto --task=worktree-prune
+'
+
+test_expect_success 'worktree-prune task honors gc.worktreePruneExpire' '
+	git worktree add worktree &&
+	rm -rf worktree &&
+
+	rm -f worktree-prune.txt &&
+	GIT_TRACE2_EVENT="$(pwd)/worktree-prune.txt" git -c gc.worktreePruneExpire=1.week.ago maintenance run --auto --task=worktree-prune &&
+	test_subcommand ! git worktree prune --expire 1.week.ago <worktree-prune.txt &&
+	test_path_is_dir .git/worktrees/worktree &&
+
+	rm -f worktree-prune.txt &&
+	GIT_TRACE2_EVENT="$(pwd)/worktree-prune.txt" git -c gc.worktreePruneExpire=now maintenance run --auto --task=worktree-prune &&
+	test_subcommand git worktree prune --expire now <worktree-prune.txt &&
+	test_path_is_missing .git/worktrees/worktree
+'
+
+test_expect_rerere_gc () {
+	negate=
+	if test "$1" = "!"
+	then
+		negate="!"
+		shift
+	fi
+
+	rm -f "rerere-gc.txt" &&
+	GIT_TRACE2_EVENT="$(pwd)/rerere-gc.txt" "$@" &&
+	test_subcommand $negate git rerere gc <rerere-gc.txt
+}
+
+test_expect_success 'rerere-gc task without --auto always collects garbage' '
+	test_expect_rerere_gc git maintenance run --task=rerere-gc
+'
+
+test_expect_success 'rerere-gc task with --auto only prunes with prunable entries' '
+	test_when_finished "rm -rf .git/rr-cache" &&
+	test_expect_rerere_gc ! git maintenance run --auto --task=rerere-gc &&
+	mkdir .git/rr-cache &&
+	test_expect_rerere_gc ! git maintenance run --auto --task=rerere-gc &&
+	: >.git/rr-cache/entry &&
+	test_expect_rerere_gc git maintenance run --auto --task=rerere-gc
+'
+
+test_expect_success 'rerere-gc task with --auto honors maintenance.rerere-gc.auto' '
+	test_when_finished "rm -rf .git/rr-cache" &&
+
+	# A negative value should always prune.
+	test_expect_rerere_gc git -c maintenance.rerere-gc.auto=-1 maintenance run --auto --task=rerere-gc &&
+
+	# A positive value prunes when there is at least one entry.
+	test_expect_rerere_gc ! git -c maintenance.rerere-gc.auto=9000 maintenance run --auto --task=rerere-gc &&
+	mkdir .git/rr-cache &&
+	test_expect_rerere_gc ! git -c maintenance.rerere-gc.auto=9000 maintenance run --auto --task=rerere-gc &&
+	: >.git/rr-cache/entry-1 &&
+	test_expect_rerere_gc git -c maintenance.rerere-gc.auto=9000 maintenance run --auto --task=rerere-gc &&
+
+	# Zero should never prune.
+	: >.git/rr-cache/entry-1 &&
+	test_expect_rerere_gc ! git -c maintenance.rerere-gc.auto=0 maintenance run --auto --task=rerere-gc
 '
 
 test_expect_success '--auto and --schedule incompatible' '
@@ -620,6 +807,22 @@ test_expect_success !MINGW 'register and unregister with regex metacharacters' '
 		maintenance.repo "$(pwd)/$META"
 '
 
+test_expect_success 'start without GIT_TEST_MAINT_SCHEDULER' '
+	test_when_finished "rm -rf systemctl.log script repo" &&
+	mkdir script &&
+	write_script script/systemctl <<-\EOF &&
+	echo "$*" >>../systemctl.log
+	EOF
+	git init repo &&
+	(
+		cd repo &&
+		sane_unset GIT_TEST_MAINT_SCHEDULER &&
+		PATH="$PWD/../script:$PATH" git maintenance start --scheduler=systemd
+	) &&
+	test_grep -- "--user list-timers" systemctl.log &&
+	test_grep -- "enable --now git-maintenance@" systemctl.log
+'
+
 test_expect_success 'start --scheduler=<scheduler>' '
 	test_expect_code 129 git maintenance start --scheduler=foo 2>err &&
 	test_grep "unrecognized --scheduler argument" err &&
@@ -800,6 +1003,9 @@ test_expect_success 'start and stop Linux/systemd maintenance' '
 	test_systemd_analyze_verify "systemd/user/git-maintenance@daily.service" &&
 	test_systemd_analyze_verify "systemd/user/git-maintenance@weekly.service" &&
 
+	grep "core.askPass=true" "systemd/user/git-maintenance@.service" &&
+	grep "credential.interactive=false" "systemd/user/git-maintenance@.service" &&
+
 	printf -- "--user enable --now git-maintenance@%s.timer\n" hourly daily weekly >expect &&
 	test_cmp expect args &&
 
@@ -906,6 +1112,77 @@ test_expect_success 'failed schedule prevents config change' '
 			git -C failcase maintenance start &&
 		test_must_fail git -C failcase config maintenance.auto || return 1
 	done
+'
+
+test_expect_success '--no-detach causes maintenance to not run in background' '
+	test_when_finished "rm -rf repo" &&
+	git init repo &&
+	(
+		cd repo &&
+
+		# Prepare the repository such that git-maintenance(1) ends up
+		# outputting something.
+		test_commit something &&
+		git config set maintenance.gc.enabled false &&
+		git config set maintenance.loose-objects.enabled true &&
+		git config set maintenance.loose-objects.auto 1 &&
+		git config set maintenance.incremental-repack.enabled true &&
+
+		GIT_TRACE2_EVENT="$(pwd)/trace.txt" \
+			git maintenance run --no-detach >out 2>&1 &&
+		! test_region maintenance detach trace.txt
+	)
+'
+
+test_expect_success '--detach causes maintenance to run in background' '
+	test_when_finished "rm -rf repo" &&
+	git init repo &&
+	(
+		cd repo &&
+
+		test_commit something &&
+		git config set maintenance.gc.enabled false &&
+		git config set maintenance.loose-objects.enabled true &&
+		git config set maintenance.loose-objects.auto 1 &&
+		git config set maintenance.incremental-repack.enabled true &&
+
+		# The extra file descriptor gets inherited to the child
+		# process, and by reading stdout we thus essentially wait for
+		# that descriptor to get closed, which indicates that the child
+		# is done, too.
+		does_not_matter=$(GIT_TRACE2_EVENT="$(pwd)/trace.txt" \
+			git maintenance run --detach 9>&1) &&
+		test_region maintenance detach trace.txt
+	)
+'
+
+test_expect_success 'repacking loose objects is quiet' '
+	test_when_finished "rm -rf repo" &&
+	git init repo &&
+	(
+		cd repo &&
+
+		test_commit something &&
+		git config set maintenance.gc.enabled false &&
+		git config set maintenance.loose-objects.enabled true &&
+		git config set maintenance.loose-objects.auto 1 &&
+
+		git maintenance run --quiet >out 2>&1 &&
+		test_must_be_empty out
+	)
+'
+
+test_expect_success 'maintenance aborts with existing lock file' '
+	test_when_finished "rm -rf repo script" &&
+	mkdir script &&
+	write_script script/systemctl <<-\EOF &&
+	true
+	EOF
+
+	git init repo &&
+	: >repo/.git/objects/schedule.lock &&
+	test_must_fail env PATH="$PWD/script:$PATH" git -C repo maintenance start --scheduler=systemd 2>err &&
+	test_grep "Another scheduled git-maintenance(1) process seems to be running" err
 '
 
 test_done

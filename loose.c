@@ -1,10 +1,9 @@
-#define USE_THE_REPOSITORY_VARIABLE
-
 #include "git-compat-util.h"
 #include "hash.h"
 #include "path.h"
 #include "object-store.h"
 #include "hex.h"
+#include "repository.h"
 #include "wrapper.h"
 #include "gettext.h"
 #include "loose.h"
@@ -76,7 +75,7 @@ static int load_one_loose_object_map(struct repository *repo, struct object_dire
 	insert_loose_map(dir, repo->hash_algo->empty_blob, repo->compat_hash_algo->empty_blob);
 	insert_loose_map(dir, repo->hash_algo->null_oid, repo->compat_hash_algo->null_oid);
 
-	strbuf_git_common_path(&path, repo, "objects/loose-object-idx");
+	repo_common_path_replace(repo, &path, "objects/loose-object-idx");
 	fp = fopen(path.buf, "rb");
 	if (!fp) {
 		strbuf_release(&path);
@@ -134,7 +133,7 @@ int repo_write_loose_object_map(struct repository *repo)
 	if (!should_use_loose_object_map(repo))
 		return 0;
 
-	strbuf_git_common_path(&path, repo, "objects/loose-object-idx");
+	repo_common_path_replace(repo, &path, "objects/loose-object-idx");
 	fd = hold_lock_file_for_update_timeout(&lock, path.buf, LOCK_DIE_ON_ERROR, -1);
 	iter = kh_begin(map);
 	if (write_in_full(fd, loose_object_header, strlen(loose_object_header)) < 0)
@@ -142,8 +141,8 @@ int repo_write_loose_object_map(struct repository *repo)
 
 	for (; iter != kh_end(map); iter++) {
 		if (kh_exist(map, iter)) {
-			if (oideq(&kh_key(map, iter), the_hash_algo->empty_tree) ||
-			    oideq(&kh_key(map, iter), the_hash_algo->empty_blob))
+			if (oideq(&kh_key(map, iter), repo->hash_algo->empty_tree) ||
+			    oideq(&kh_key(map, iter), repo->hash_algo->empty_blob))
 				continue;
 			strbuf_addf(&buf, "%s %s\n", oid_to_hex(&kh_key(map, iter)), oid_to_hex(kh_value(map, iter)));
 			if (write_in_full(fd, buf.buf, buf.len) < 0)
@@ -162,7 +161,7 @@ int repo_write_loose_object_map(struct repository *repo)
 errout:
 	rollback_lock_file(&lock);
 	strbuf_release(&buf);
-	error_errno(_("failed to write loose object index %s\n"), path.buf);
+	error_errno(_("failed to write loose object index %s"), path.buf);
 	strbuf_release(&path);
 	return -1;
 }
@@ -175,7 +174,7 @@ static int write_one_object(struct repository *repo, const struct object_id *oid
 	struct stat st;
 	struct strbuf buf = STRBUF_INIT, path = STRBUF_INIT;
 
-	strbuf_git_common_path(&path, repo, "objects/loose-object-idx");
+	repo_common_path_replace(repo, &path, "objects/loose-object-idx");
 	hold_lock_file_for_update_timeout(&lock, path.buf, LOCK_DIE_ON_ERROR, -1);
 
 	fd = open(path.buf, O_WRONLY | O_CREAT | O_APPEND, 0666);
@@ -191,13 +190,13 @@ static int write_one_object(struct repository *repo, const struct object_id *oid
 		goto errout;
 	if (close(fd))
 		goto errout;
-	adjust_shared_perm(path.buf);
+	adjust_shared_perm(repo, path.buf);
 	rollback_lock_file(&lock);
 	strbuf_release(&buf);
 	strbuf_release(&path);
 	return 0;
 errout:
-	error_errno(_("failed to write loose object index %s\n"), path.buf);
+	error_errno(_("failed to write loose object index %s"), path.buf);
 	close(fd);
 	rollback_lock_file(&lock);
 	strbuf_release(&buf);

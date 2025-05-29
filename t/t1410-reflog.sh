@@ -7,7 +7,6 @@ test_description='Test prune and reflog expiration'
 GIT_TEST_DEFAULT_INITIAL_BRANCH_NAME=main
 export GIT_TEST_DEFAULT_INITIAL_BRANCH_NAME
 
-TEST_PASSES_SANITIZE_LEAK=true
 . ./test-lib.sh
 
 check_have () {
@@ -144,6 +143,14 @@ test_expect_success rewind '
 
 	git reflog refs/heads/main >output &&
 	test_line_count = 5 output
+'
+
+test_expect_success 'reflog expire should not barf on an annotated tag' '
+	test_when_finished "git tag -d v0.tag || :" &&
+	git -c core.logAllRefUpdates=always \
+		tag -a -m "tag name" v0.tag main &&
+	git reflog expire --dry-run refs/tags/v0.tag 2>err &&
+	test_grep ! "error: [Oo]bject .* not a commit" err
 '
 
 test_expect_success 'corrupt and check' '
@@ -308,9 +315,9 @@ test_expect_success 'git reflog expire unknown reference' '
 	test_config gc.reflogexpireunreachable never &&
 
 	test_must_fail git reflog expire main@{123} 2>stderr &&
-	test_grep "points nowhere" stderr &&
+	test_grep "error: reflog could not be found: ${SQ}main@{123}${SQ}" stderr &&
 	test_must_fail git reflog expire does-not-exist 2>stderr &&
-	test_grep "points nowhere" stderr
+	test_grep "error: reflog could not be found: ${SQ}does-not-exist${SQ}" stderr
 '
 
 test_expect_success 'checkout should not delete log for packed ref' '
@@ -541,6 +548,128 @@ test_expect_success 'reflog with invalid object ID can be listed' '
 		EOF
 		git reflog list >actual &&
 		test_cmp expect actual
+	)
+'
+
+test_expect_success 'reflog drop non-existent ref' '
+	test_when_finished "rm -rf repo" &&
+	git init repo &&
+	(
+		cd repo &&
+		test_must_fail git reflog exists refs/heads/non-existent &&
+		test_must_fail git reflog drop refs/heads/non-existent 2>stderr &&
+		test_grep "error: reflog could not be found: ${SQ}refs/heads/non-existent${SQ}" stderr
+	)
+'
+
+test_expect_success 'reflog drop' '
+	test_when_finished "rm -rf repo" &&
+	git init repo &&
+	(
+		cd repo &&
+		test_commit A &&
+		test_commit_bulk --ref=refs/heads/branch 1 &&
+		git reflog exists refs/heads/main &&
+		git reflog exists refs/heads/branch &&
+		git reflog drop refs/heads/main &&
+		test_must_fail git reflog exists refs/heads/main &&
+		git reflog exists refs/heads/branch
+	)
+'
+
+test_expect_success 'reflog drop multiple references' '
+	test_when_finished "rm -rf repo" &&
+	git init repo &&
+	(
+		cd repo &&
+		test_commit A &&
+		test_commit_bulk --ref=refs/heads/branch 1 &&
+		git reflog exists refs/heads/main &&
+		git reflog exists refs/heads/branch &&
+		git reflog drop refs/heads/main refs/heads/branch &&
+		test_must_fail git reflog exists refs/heads/main &&
+		test_must_fail git reflog exists refs/heads/branch
+	)
+'
+
+test_expect_success 'reflog drop multiple references some non-existent' '
+	test_when_finished "rm -rf repo" &&
+	git init repo &&
+	(
+		cd repo &&
+		test_commit A &&
+		test_commit_bulk --ref=refs/heads/branch 1 &&
+		git reflog exists refs/heads/main &&
+		git reflog exists refs/heads/branch &&
+		test_must_fail git reflog exists refs/heads/non-existent &&
+		test_must_fail git reflog drop refs/heads/main refs/heads/non-existent refs/heads/branch 2>stderr &&
+		test_must_fail git reflog exists refs/heads/main &&
+		test_must_fail git reflog exists refs/heads/branch &&
+		test_must_fail git reflog exists refs/heads/non-existent &&
+		test_grep "error: reflog could not be found: ${SQ}refs/heads/non-existent${SQ}" stderr
+	)
+'
+
+test_expect_success 'reflog drop --all' '
+	test_when_finished "rm -rf repo" &&
+	git init repo &&
+	(
+		cd repo &&
+		test_commit A &&
+		test_commit_bulk --ref=refs/heads/branch 1 &&
+		git reflog exists refs/heads/main &&
+		git reflog exists refs/heads/branch &&
+		git reflog drop --all &&
+		test_must_fail git reflog exists refs/heads/main &&
+		test_must_fail git reflog exists refs/heads/branch
+	)
+'
+
+test_expect_success 'reflog drop --all multiple worktrees' '
+	test_when_finished "rm -rf repo" &&
+	test_when_finished "rm -rf wt" &&
+	git init repo &&
+	(
+		cd repo &&
+		test_commit A &&
+		git worktree add ../wt &&
+		test_commit_bulk -C ../wt --ref=refs/heads/branch 1 &&
+		git reflog exists refs/heads/main &&
+		git reflog exists refs/heads/branch &&
+		git reflog drop --all &&
+		test_must_fail git reflog exists refs/heads/main &&
+		test_must_fail git reflog exists refs/heads/branch
+	)
+'
+
+test_expect_success 'reflog drop --all --single-worktree' '
+	test_when_finished "rm -rf repo" &&
+	test_when_finished "rm -rf wt" &&
+	git init repo &&
+	(
+		cd repo &&
+		test_commit A &&
+		git worktree add ../wt &&
+		test_commit -C ../wt foobar &&
+		git reflog exists refs/heads/main &&
+		git reflog exists refs/heads/wt &&
+		test-tool ref-store worktree:wt reflog-exists HEAD &&
+		git reflog drop --all --single-worktree &&
+		test_must_fail git reflog exists refs/heads/main &&
+		test_must_fail git reflog exists refs/heads/wt &&
+		test_must_fail test-tool ref-store worktree:main reflog-exists HEAD &&
+		test-tool ref-store worktree:wt reflog-exists HEAD
+	)
+'
+
+test_expect_success 'reflog drop --all with reference' '
+	test_when_finished "rm -rf repo" &&
+	git init repo &&
+	(
+		cd repo &&
+		test_commit A &&
+		test_must_fail git reflog drop --all refs/heads/main 2>stderr &&
+		test_grep "usage: references specified along with --all" stderr
 	)
 '
 

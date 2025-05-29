@@ -1,4 +1,5 @@
 #define USE_THE_REPOSITORY_VARIABLE
+#define DISABLE_SIGN_COMPARE_WARNINGS
 
 #include "git-compat-util.h"
 #include "advice.h"
@@ -16,6 +17,7 @@
 #include "revision.h"
 #include "diffcore.h"
 #include "quote.h"
+#include "repository.h"
 #include "run-command.h"
 #include "strvec.h"
 #include "remote.h"
@@ -152,7 +154,7 @@ void wt_status_prepare(struct repository *r, struct wt_status *s)
 					"HEAD", 0, NULL, NULL);
 	s->reference = "HEAD";
 	s->fp = stdout;
-	s->index_file = get_index_file();
+	s->index_file = repo_get_index_file(the_repository);
 	s->change.strdup_strings = 1;
 	s->untracked.strdup_strings = 1;
 	s->ignored.strdup_strings = 1;
@@ -716,6 +718,7 @@ static int add_file_to_list(const struct object_id *oid,
 static void wt_status_collect_changes_initial(struct wt_status *s)
 {
 	struct index_state *istate = s->repo->index;
+	struct strbuf base = STRBUF_INIT;
 	int i;
 
 	for (i = 0; i < istate->cache_nr; i++) {
@@ -734,7 +737,6 @@ static void wt_status_collect_changes_initial(struct wt_status *s)
 			 * expanding the trees to find the elements that are new in this
 			 * tree and marking them with DIFF_STATUS_ADDED.
 			 */
-			struct strbuf base = STRBUF_INIT;
 			struct pathspec ps = { 0 };
 			struct tree *tree = lookup_tree(istate->repo, &ce->oid);
 
@@ -742,9 +744,11 @@ static void wt_status_collect_changes_initial(struct wt_status *s)
 			ps.has_wildcard = 1;
 			ps.max_depth = -1;
 
+			strbuf_reset(&base);
 			strbuf_add(&base, ce->name, ce->ce_namelen);
 			read_tree_at(istate->repo, tree, &base, 0, &ps,
 				     add_file_to_list, s);
+
 			continue;
 		}
 
@@ -771,6 +775,8 @@ static void wt_status_collect_changes_initial(struct wt_status *s)
 			s->committable = 1;
 		}
 	}
+
+	strbuf_release(&base);
 }
 
 static void wt_status_collect_untracked(struct wt_status *s)
@@ -1283,7 +1289,8 @@ static void show_am_in_progress(struct wt_status *s,
 static char *read_line_from_git_path(const char *filename)
 {
 	struct strbuf buf = STRBUF_INIT;
-	FILE *fp = fopen_or_warn(git_path("%s", filename), "r");
+	FILE *fp = fopen_or_warn(repo_git_path_append(the_repository, &buf,
+						      "%s", filename), "r");
 
 	if (!fp) {
 		strbuf_release(&buf);
@@ -1377,27 +1384,33 @@ static void abbrev_oid_in_line(struct strbuf *line)
 
 static int read_rebase_todolist(const char *fname, struct string_list *lines)
 {
-	struct strbuf line = STRBUF_INIT;
-	FILE *f = fopen(git_path("%s", fname), "r");
+	struct strbuf buf = STRBUF_INIT;
+	FILE *f = fopen(repo_git_path_append(the_repository, &buf, "%s", fname), "r");
+	int ret;
 
 	if (!f) {
-		if (errno == ENOENT)
-			return -1;
+		if (errno == ENOENT) {
+			ret = -1;
+			goto out;
+		}
 		die_errno("Could not open file %s for reading",
-			  git_path("%s", fname));
+			  repo_git_path_replace(the_repository, &buf, "%s", fname));
 	}
-	while (!strbuf_getline_lf(&line, f)) {
-		if (starts_with(line.buf, comment_line_str))
+	while (!strbuf_getline_lf(&buf, f)) {
+		if (starts_with(buf.buf, comment_line_str))
 			continue;
-		strbuf_trim(&line);
-		if (!line.len)
+		strbuf_trim(&buf);
+		if (!buf.len)
 			continue;
-		abbrev_oid_in_line(&line);
-		string_list_append(lines, line.buf);
+		abbrev_oid_in_line(&buf);
+		string_list_append(lines, buf.buf);
 	}
 	fclose(f);
-	strbuf_release(&line);
-	return 0;
+
+	ret = 0;
+out:
+	strbuf_release(&buf);
+	return ret;
 }
 
 static void show_rebase_information(struct wt_status *s,
@@ -1428,9 +1441,12 @@ static void show_rebase_information(struct wt_status *s,
 				i < have_done.nr;
 				i++)
 				status_printf_ln(s, color, "   %s", have_done.items[i].string);
-			if (have_done.nr > nr_lines_to_show && s->hints)
+			if (have_done.nr > nr_lines_to_show && s->hints) {
+				char *path = repo_git_path(the_repository, "rebase-merge/done");
 				status_printf_ln(s, color,
-					_("  (see more in file %s)"), git_path("rebase-merge/done"));
+					_("  (see more in file %s)"), path);
+				free(path);
+			}
 		}
 
 		if (yet_to_do.nr == 0)
@@ -1618,7 +1634,7 @@ static char *get_branch(const struct worktree *wt, const char *path)
 	struct object_id oid;
 	const char *branch_name;
 
-	if (strbuf_read_file(&sb, worktree_git_path(wt, "%s", path), 0) <= 0)
+	if (strbuf_read_file(&sb, worktree_git_path(the_repository, wt, "%s", path), 0) <= 0)
 		goto got_nothing;
 
 	while (sb.len && sb.buf[sb.len - 1] == '\n')
@@ -1716,18 +1732,18 @@ int wt_status_check_rebase(const struct worktree *wt,
 {
 	struct stat st;
 
-	if (!stat(worktree_git_path(wt, "rebase-apply"), &st)) {
-		if (!stat(worktree_git_path(wt, "rebase-apply/applying"), &st)) {
+	if (!stat(worktree_git_path(the_repository, wt, "rebase-apply"), &st)) {
+		if (!stat(worktree_git_path(the_repository, wt, "rebase-apply/applying"), &st)) {
 			state->am_in_progress = 1;
-			if (!stat(worktree_git_path(wt, "rebase-apply/patch"), &st) && !st.st_size)
+			if (!stat(worktree_git_path(the_repository, wt, "rebase-apply/patch"), &st) && !st.st_size)
 				state->am_empty_patch = 1;
 		} else {
 			state->rebase_in_progress = 1;
 			state->branch = get_branch(wt, "rebase-apply/head-name");
 			state->onto = get_branch(wt, "rebase-apply/onto");
 		}
-	} else if (!stat(worktree_git_path(wt, "rebase-merge"), &st)) {
-		if (!stat(worktree_git_path(wt, "rebase-merge/interactive"), &st))
+	} else if (!stat(worktree_git_path(the_repository, wt, "rebase-merge"), &st)) {
+		if (!stat(worktree_git_path(the_repository, wt, "rebase-merge/interactive"), &st))
 			state->rebase_interactive_in_progress = 1;
 		else
 			state->rebase_in_progress = 1;
@@ -1743,7 +1759,7 @@ int wt_status_check_bisect(const struct worktree *wt,
 {
 	struct stat st;
 
-	if (!stat(worktree_git_path(wt, "BISECT_LOG"), &st)) {
+	if (!stat(worktree_git_path(the_repository, wt, "BISECT_LOG"), &st)) {
 		state->bisect_in_progress = 1;
 		state->bisecting_from = get_branch(wt, "BISECT_START");
 		return 1;
@@ -1808,10 +1824,10 @@ void wt_status_get_state(struct repository *r,
 	if (!sequencer_get_last_command(r, &action)) {
 		if (action == REPLAY_PICK && !state->cherry_pick_in_progress) {
 			state->cherry_pick_in_progress = 1;
-			oidcpy(&state->cherry_pick_head_oid, null_oid());
+			oidcpy(&state->cherry_pick_head_oid, null_oid(the_hash_algo));
 		} else if (action == REPLAY_REVERT && !state->revert_in_progress) {
 			state->revert_in_progress = 1;
-			oidcpy(&state->revert_head_oid, null_oid());
+			oidcpy(&state->revert_head_oid, null_oid(the_hash_algo));
 		}
 	}
 	if (get_detached_from)
@@ -2595,7 +2611,7 @@ int has_unstaged_changes(struct repository *r, int ignore_submodules)
 	rev_info.diffopt.flags.quick = 1;
 	diff_setup_done(&rev_info.diffopt);
 	run_diff_files(&rev_info, 0);
-	result = diff_result_code(&rev_info.diffopt);
+	result = diff_result_code(&rev_info);
 	release_revisions(&rev_info);
 	return result;
 }
@@ -2629,7 +2645,7 @@ int has_uncommitted_changes(struct repository *r,
 
 	diff_setup_done(&rev_info.diffopt);
 	run_diff_index(&rev_info, DIFF_INDEX_CACHED);
-	result = diff_result_code(&rev_info.diffopt);
+	result = diff_result_code(&rev_info);
 	release_revisions(&rev_info);
 	return result;
 }

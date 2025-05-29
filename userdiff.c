@@ -1,3 +1,6 @@
+#define USE_THE_REPOSITORY_VARIABLE
+#define DISABLE_SIGN_COMPARE_WARNINGS
+
 #include "git-compat-util.h"
 #include "config.h"
 #include "userdiff.h"
@@ -56,20 +59,30 @@ PATTERNS("bash",
 	 "("
 	 "("
 	     /* POSIX identifier with mandatory parentheses */
-	     "[a-zA-Z_][a-zA-Z0-9_]*[ \t]*\\([ \t]*\\))"
+	     "([a-zA-Z_][a-zA-Z0-9_]*[ \t]*\\([ \t]*\\))"
 	 "|"
 	     /* Bashism identifier with optional parentheses */
-	     "(function[ \t]+[a-zA-Z_][a-zA-Z0-9_]*(([ \t]*\\([ \t]*\\))|([ \t]+))"
+	     "(function[ \t]+[a-zA-Z_][a-zA-Z0-9_]*(([ \t]*\\([ \t]*\\))|([ \t]+)))"
 	 ")"
-	 /* Optional whitespace */
-	 "[ \t]*"
-	 /* Compound command starting with `{`, `(`, `((` or `[[` */
-	 "(\\{|\\(\\(?|\\[\\[)"
+	 /* Everything after the function header is captured  */
+	 ".*$"
 	 /* End of captured text */
 	 ")",
 	 /* -- */
-	 /* Characters not in the default $IFS value */
-	 "[^ \t]+"),
+	 /* Identifiers: variable and function names */
+	  "[a-zA-Z_][a-zA-Z0-9_]*"
+	 /* Shell variables: $VAR, ${VAR} */
+	  "|\\$[a-zA-Z0-9_]+|\\$\\{"
+	  /*Command list separators and redirection operators  */
+	 "|\\|\\||&&|<<|>>"
+	 /* Operators ending in '=' (comparison + compound assignment) */
+	 "|==|!=|<=|>=|[-+*/%&|^]="
+	 /* Additional parameter expansion operators */
+	 "|:=|:-|:\\+|:\\?|##|%%|\\^\\^|,,"
+	 /* Command-line options (to avoid splitting -option) */
+	 "|[-a-zA-Z0-9_]+"
+	 /* Brackets and grouping symbols */
+	 "|\\(|\\)|\\{|\\}|\\[|\\]"),
 PATTERNS("bibtex",
 	 "(@[a-zA-Z]{1,}[ \t]*\\{{0,1}[ \t]*[^ \t\"@',\\#}{~%]*).*$",
 	 /* -- */
@@ -208,6 +221,10 @@ PATTERNS("html",
 	 "^[ \t]*(<[Hh][1-6]([ \t].*)?>.*)$",
 	 /* -- */
 	 "[^<>= \t]+"),
+PATTERNS("ini",
+	 "^[ \t]*\\[[^]]+\\]",
+	 /* -- */
+	 "[^ \t]+"),
 PATTERNS("java",
 	 "!^[ \t]*(catch|do|for|if|instanceof|new|return|switch|throw|while)\n"
 	 /* Class, enum, interface, and record declarations */
@@ -399,8 +416,11 @@ static struct userdiff_driver *userdiff_find_by_namelen(const char *name, size_t
 static int parse_funcname(struct userdiff_funcname *f, const char *k,
 		const char *v, int cflags)
 {
-	if (git_config_string((char **) &f->pattern, k, v) < 0)
+	f->pattern = NULL;
+	FREE_AND_NULL(f->pattern_owned);
+	if (git_config_string(&f->pattern_owned, k, v) < 0)
 		return -1;
+	f->pattern = f->pattern_owned;
 	f->cflags = cflags;
 	return 0;
 }
@@ -444,20 +464,37 @@ int userdiff_config(const char *k, const char *v)
 		return parse_funcname(&drv->funcname, k, v, REG_EXTENDED);
 	if (!strcmp(type, "binary"))
 		return parse_tristate(&drv->binary, k, v);
-	if (!strcmp(type, "command"))
-		return git_config_string((char **) &drv->external.cmd, k, v);
+	if (!strcmp(type, "command")) {
+		FREE_AND_NULL(drv->external.cmd);
+		return git_config_string(&drv->external.cmd, k, v);
+	}
 	if (!strcmp(type, "trustexitcode")) {
 		drv->external.trust_exit_code = git_config_bool(k, v);
 		return 0;
 	}
-	if (!strcmp(type, "textconv"))
-		return git_config_string((char **) &drv->textconv, k, v);
+	if (!strcmp(type, "textconv")) {
+		int ret;
+		FREE_AND_NULL(drv->textconv_owned);
+		ret = git_config_string(&drv->textconv_owned, k, v);
+		drv->textconv = drv->textconv_owned;
+		return ret;
+	}
 	if (!strcmp(type, "cachetextconv"))
 		return parse_bool(&drv->textconv_want_cache, k, v);
-	if (!strcmp(type, "wordregex"))
-		return git_config_string((char **) &drv->word_regex, k, v);
-	if (!strcmp(type, "algorithm"))
-		return git_config_string((char **) &drv->algorithm, k, v);
+	if (!strcmp(type, "wordregex")) {
+		int ret;
+		FREE_AND_NULL(drv->word_regex_owned);
+		ret = git_config_string(&drv->word_regex_owned, k, v);
+		drv->word_regex = drv->word_regex_owned;
+		return ret;
+	}
+	if (!strcmp(type, "algorithm")) {
+		int ret;
+		FREE_AND_NULL(drv->algorithm_owned);
+		ret = git_config_string(&drv->algorithm_owned, k, v);
+		drv->algorithm = drv->algorithm_owned;
+		return ret;
+	}
 
 	return 0;
 }

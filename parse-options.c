@@ -60,12 +60,12 @@ static enum parse_opt_result get_arg(struct parse_opt_ctx_t *p,
 	return 0;
 }
 
-static void fix_filename(const char *prefix, char **file)
+static char *fix_filename(const char *prefix, const char *file)
 {
 	if (!file || !*file)
-		; /* leave as NULL */
+		return NULL;
 	else
-		*file = prefix_filename_except_for_dash(prefix, *file);
+		return prefix_filename_except_for_dash(prefix, file);
 }
 
 static enum parse_opt_result do_get_value(struct parse_opt_ctx_t *p,
@@ -73,7 +73,7 @@ static enum parse_opt_result do_get_value(struct parse_opt_ctx_t *p,
 					  enum opt_parsed flags,
 					  const char **argp)
 {
-	const char *s, *arg;
+	const char *arg;
 	const int unset = flags & OPT_UNSET;
 	int err;
 
@@ -129,18 +129,24 @@ static enum parse_opt_result do_get_value(struct parse_opt_ctx_t *p,
 		return 0;
 
 	case OPTION_FILENAME:
+	{
+		const char *value;
+
+		FREE_AND_NULL(*(char **)opt->value);
+
 		err = 0;
+
 		if (unset)
-			*(const char **)opt->value = NULL;
+			value = NULL;
 		else if (opt->flags & PARSE_OPT_OPTARG && !p->opt)
-			*(const char **)opt->value = (const char *)opt->defval;
+			value = (const char *) opt->defval;
 		else
-			err = get_arg(p, opt, flags, (const char **)opt->value);
+			err = get_arg(p, opt, flags, &value);
 
 		if (!err)
-			fix_filename(p->prefix, (char **)opt->value);
+			*(char **)opt->value = fix_filename(p->prefix, value);
 		return err;
-
+	}
 	case OPTION_CALLBACK:
 	{
 		const char *p_arg = NULL;
@@ -166,41 +172,93 @@ static enum parse_opt_result do_get_value(struct parse_opt_ctx_t *p,
 			return (*opt->ll_callback)(p, opt, p_arg, p_unset);
 	}
 	case OPTION_INTEGER:
-		if (unset) {
-			*(int *)opt->value = 0;
-			return 0;
-		}
-		if (opt->flags & PARSE_OPT_OPTARG && !p->opt) {
-			*(int *)opt->value = opt->defval;
-			return 0;
-		}
-		if (get_arg(p, opt, flags, &arg))
-			return -1;
-		if (!*arg)
-			return error(_("%s expects a numerical value"),
-				     optname(opt, flags));
-		*(int *)opt->value = strtol(arg, (char **)&s, 10);
-		if (*s)
-			return error(_("%s expects a numerical value"),
-				     optname(opt, flags));
-		return 0;
+	{
+		intmax_t upper_bound = INTMAX_MAX >> (bitsizeof(intmax_t) - CHAR_BIT * opt->precision);
+		intmax_t lower_bound = -upper_bound - 1;
+		intmax_t value;
 
-	case OPTION_MAGNITUDE:
 		if (unset) {
-			*(unsigned long *)opt->value = 0;
-			return 0;
-		}
-		if (opt->flags & PARSE_OPT_OPTARG && !p->opt) {
-			*(unsigned long *)opt->value = opt->defval;
-			return 0;
-		}
-		if (get_arg(p, opt, flags, &arg))
+			value = 0;
+		} else if (opt->flags & PARSE_OPT_OPTARG && !p->opt) {
+			value = opt->defval;
+		} else if (get_arg(p, opt, flags, &arg)) {
 			return -1;
-		if (!git_parse_ulong(arg, opt->value))
+		} else if (!*arg) {
+			return error(_("%s expects a numerical value"),
+				     optname(opt, flags));
+		} else if (!git_parse_signed(arg, &value, upper_bound)) {
+			if (errno == ERANGE)
+				return error(_("value %s for %s not in range [%"PRIdMAX",%"PRIdMAX"]"),
+					     arg, optname(opt, flags), lower_bound, upper_bound);
+
+			return error(_("%s expects an integer value with an optional k/m/g suffix"),
+				     optname(opt, flags));
+		}
+
+		if (value < lower_bound)
+			return error(_("value %s for %s not in range [%"PRIdMAX",%"PRIdMAX"]"),
+				     arg, optname(opt, flags), (intmax_t)lower_bound, (intmax_t)upper_bound);
+
+		switch (opt->precision) {
+		case 1:
+			*(int8_t *)opt->value = value;
+			return 0;
+		case 2:
+			*(int16_t *)opt->value = value;
+			return 0;
+		case 4:
+			*(int32_t *)opt->value = value;
+			return 0;
+		case 8:
+			*(int64_t *)opt->value = value;
+			return 0;
+		default:
+			BUG("invalid precision for option %s",
+			    optname(opt, flags));
+		}
+	}
+	case OPTION_UNSIGNED:
+	{
+		uintmax_t upper_bound = UINTMAX_MAX >> (bitsizeof(uintmax_t) - CHAR_BIT * opt->precision);
+		uintmax_t value;
+
+		if (unset) {
+			value = 0;
+		} else if (opt->flags & PARSE_OPT_OPTARG && !p->opt) {
+			value = opt->defval;
+		} else if (get_arg(p, opt, flags, &arg)) {
+			return -1;
+		} else if (!*arg) {
+			return error(_("%s expects a numerical value"),
+				     optname(opt, flags));
+		} else if (!git_parse_unsigned(arg, &value, upper_bound)) {
+			if (errno == ERANGE)
+				return error(_("value %s for %s not in range [%"PRIdMAX",%"PRIdMAX"]"),
+					     arg, optname(opt, flags), (uintmax_t) 0, upper_bound);
+
 			return error(_("%s expects a non-negative integer value"
 				       " with an optional k/m/g suffix"),
 				     optname(opt, flags));
-		return 0;
+		}
+
+		switch (opt->precision) {
+		case 1:
+			*(uint8_t *)opt->value = value;
+			return 0;
+		case 2:
+			*(uint16_t *)opt->value = value;
+			return 0;
+		case 4:
+			*(uint32_t *)opt->value = value;
+			return 0;
+		case 8:
+			*(uint64_t *)opt->value = value;
+			return 0;
+		default:
+			BUG("invalid precision for option %s",
+			    optname(opt, flags));
+		}
+	}
 
 	default:
 		BUG("opt->type %d should not happen", opt->type);
@@ -650,7 +708,7 @@ static void show_negated_gitcomp(const struct option *opts, int show_all,
 		case OPTION_STRING:
 		case OPTION_FILENAME:
 		case OPTION_INTEGER:
-		case OPTION_MAGNITUDE:
+		case OPTION_UNSIGNED:
 		case OPTION_CALLBACK:
 		case OPTION_BIT:
 		case OPTION_NEGBIT:
@@ -702,7 +760,7 @@ static int show_gitcomp(const struct option *opts, int show_all)
 		case OPTION_STRING:
 		case OPTION_FILENAME:
 		case OPTION_INTEGER:
-		case OPTION_MAGNITUDE:
+		case OPTION_UNSIGNED:
 		case OPTION_CALLBACK:
 			if (opts->flags & PARSE_OPT_NOARG)
 				break;
@@ -1070,11 +1128,48 @@ static int usage_argh(const struct option *opts, FILE *outfile)
 		!opts->argh || !!strpbrk(opts->argh, "()<>[]|");
 	if (opts->flags & PARSE_OPT_OPTARG)
 		if (opts->long_name)
-			s = literal ? "[=%s]" : "[=<%s>]";
+			/*
+			 * TRANSLATORS: The "<%s>" part of this string
+			 * stands for an optional value given to a command
+			 * line option in the long form, and "<>" is there
+			 * as a convention to signal that it is a
+			 * placeholder (i.e. the user should substitute it
+			 * with the real value).  If your language uses a
+			 * different convention, you can change "<%s>" part
+			 * to match yours, e.g. it might use "|%s|" instead,
+			 * or if the alphabet is different enough it may use
+			 * "%s" without any placeholder signal.  Most
+			 * translations leave this message as is.
+			 */
+			s = literal ? "[=%s]" : _("[=<%s>]");
 		else
-			s = literal ? "[%s]" : "[<%s>]";
+			/*
+			 * TRANSLATORS: The "<%s>" part of this string
+			 * stands for an optional value given to a command
+			 * line option in the short form, and "<>" is there
+			 * as a convention to signal that it is a
+			 * placeholder (i.e. the user should substitute it
+			 * with the real value).  If your language uses a
+			 * different convention, you can change "<%s>" part
+			 * to match yours, e.g. it might use "|%s|" instead,
+			 * or if the alphabet is different enough it may use
+			 * "%s" without any placeholder signal.  Most
+			 * translations leave this message as is.
+			 */
+			s = literal ? "[%s]" : _("[<%s>]");
 	else
-		s = literal ? " %s" : " <%s>";
+		/*
+		 * TRANSLATORS: The "<%s>" part of this string stands for a
+		 * value given to a command line option, and "<>" is there
+		 * as a convention to signal that it is a placeholder
+		 * (i.e. the user should substitute it with the real value).
+		 * If your language uses a different convention, you can
+		 * change "<%s>" part to match yours, e.g. it might use
+		 * "|%s|" instead, or if the alphabet is different enough it
+		 * may use "%s" without any placeholder signal.  Most
+		 * translations leave this message as is.
+		 */
+		s = literal ? " %s" : _(" <%s>");
 	return utf8_fprintf(outfile, s, opts->argh ? _(opts->argh) : _("..."));
 }
 
@@ -1274,6 +1369,16 @@ void NORETURN usage_with_options(const char * const *usagestr,
 {
 	usage_with_options_internal(NULL, usagestr, opts, 0, 1);
 	exit(129);
+}
+
+void show_usage_with_options_if_asked(int ac, const char **av,
+				      const char * const *usagestr,
+				      const struct option *opts)
+{
+	if (ac == 2 && !strcmp(av[1], "-h")) {
+		usage_with_options_internal(NULL, usagestr, opts, 0, 0);
+		exit(129);
+	}
 }
 
 void NORETURN usage_msg_opt(const char *msg,

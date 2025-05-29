@@ -1,4 +1,5 @@
 #define USE_THE_REPOSITORY_VARIABLE
+#define DISABLE_SIGN_COMPARE_WARNINGS
 
 #include "git-compat-util.h"
 #include "config.h"
@@ -9,7 +10,7 @@
 #include "pkt-line.h"
 #include "sideband.h"
 #include "repository.h"
-#include "object-store-ll.h"
+#include "object-store.h"
 #include "oid-array.h"
 #include "object.h"
 #include "commit.h"
@@ -31,6 +32,7 @@
 #include "write-or-die.h"
 #include "json-writer.h"
 #include "strmap.h"
+#include "promisor-remote.h"
 
 /* Remember to update object flag allocation in object.h */
 #define THEY_HAVE	(1u << 11)
@@ -166,6 +168,7 @@ static void upload_pack_data_clear(struct upload_pack_data *data)
 	object_array_clear(&data->extra_edge_obj);
 	list_objects_filter_release(&data->filter_options);
 	string_list_clear(&data->allowed_filters, 0);
+	string_list_clear(&data->uri_protocols, 0);
 
 	free((char *)data->pack_objects_hook);
 }
@@ -317,6 +320,8 @@ static void create_pack_file(struct upload_pack_data *pack_data,
 		strvec_push(&pack_objects.args, "--delta-base-offset");
 	if (pack_data->use_include_tag)
 		strvec_push(&pack_objects.args, "--include-tag");
+	if (repo_has_accepted_promisor_remote(the_repository))
+		strvec_push(&pack_objects.args, "--missing=allow-promisor");
 	if (pack_data->filter_options.choice) {
 		const char *spec =
 			expand_list_objects_filter_spec(&pack_data->filter_options);
@@ -504,8 +509,7 @@ static int got_oid(struct upload_pack_data *data,
 {
 	if (get_oid_hex(hex, oid))
 		die("git upload-pack: expected SHA1 object, got '%s'", hex);
-	if (!repo_has_object_file_with_flags(the_repository, oid,
-					     OBJECT_INFO_QUICK | OBJECT_INFO_SKIP_FETCH_OBJECT))
+	if (!has_object(the_repository, oid, 0))
 		return -1;
 	return do_got_oid(data, oid);
 }
@@ -660,8 +664,8 @@ static int do_reachable_revlist(struct child_process *cmd,
 
 	cmd_in = xfdopen(cmd->in, "w");
 
-	for (i = get_max_object_index(); 0 < i; ) {
-		o = get_indexed_object(--i);
+	for (i = get_max_object_index(the_repository); 0 < i; ) {
+		o = get_indexed_object(the_repository, --i);
 		if (!o)
 			continue;
 		if (reachable && o->type == OBJ_COMMIT)
@@ -709,10 +713,13 @@ static int get_reachable_list(struct upload_pack_data *data,
 	struct object *o;
 	char namebuf[GIT_MAX_HEXSZ + 2]; /* ^ + hash + LF */
 	const unsigned hexsz = the_hash_algo->hexsz;
+	int ret;
 
 	if (do_reachable_revlist(&cmd, &data->shallows, reachable,
-				 data->allow_uor) < 0)
-		return -1;
+				 data->allow_uor) < 0) {
+		ret = -1;
+		goto out;
+	}
 
 	while ((i = read_in_full(cmd.out, namebuf, hexsz + 1)) == hexsz + 1) {
 		struct object_id oid;
@@ -726,8 +733,8 @@ static int get_reachable_list(struct upload_pack_data *data,
 			o->flags &= ~TMP_MARK;
 		}
 	}
-	for (i = get_max_object_index(); 0 < i; i--) {
-		o = get_indexed_object(i - 1);
+	for (i = get_max_object_index(the_repository); 0 < i; i--) {
+		o = get_indexed_object(the_repository, i - 1);
 		if (o && o->type == OBJ_COMMIT &&
 		    (o->flags & TMP_MARK)) {
 			add_object_array(o, NULL, reachable);
@@ -736,10 +743,16 @@ static int get_reachable_list(struct upload_pack_data *data,
 	}
 	close(cmd.out);
 
-	if (finish_command(&cmd))
-		return -1;
+	if (finish_command(&cmd)) {
+		ret = -1;
+		goto out;
+	}
 
-	return 0;
+	ret = 0;
+
+out:
+	child_process_clear(&cmd);
+	return ret;
 }
 
 static int has_unreachable(struct object_array *src, enum allow_uor allow_uor)
@@ -749,7 +762,7 @@ static int has_unreachable(struct object_array *src, enum allow_uor allow_uor)
 	int i;
 
 	if (do_reachable_revlist(&cmd, src, NULL, allow_uor) < 0)
-		return 1;
+		goto error;
 
 	/*
 	 * The commits out of the rev-list are not ancestors of
@@ -775,6 +788,7 @@ static int has_unreachable(struct object_array *src, enum allow_uor allow_uor)
 error:
 	if (cmd.out >= 0)
 		close(cmd.out);
+	child_process_clear(&cmd);
 	return 1;
 }
 
@@ -857,7 +871,7 @@ static void send_unshallow(struct upload_pack_data *data)
 	}
 }
 
-static int check_ref(const char *refname_full, const struct object_id *oid,
+static int check_ref(const char *refname_full, const char *referent UNUSED, const struct object_id *oid,
 		     int flag, void *cb_data);
 static void deepen(struct upload_pack_data *data, int depth)
 {
@@ -1015,10 +1029,14 @@ static int process_deepen_not(const char *line, struct oidset *deepen_not, int *
 {
 	const char *arg;
 	if (skip_prefix(line, "deepen-not ", &arg)) {
+		int cnt;
 		char *ref = NULL;
 		struct object_id oid;
-		if (expand_ref(the_repository, arg, strlen(arg), &oid, &ref) != 1)
+		cnt = expand_ref(the_repository, arg, strlen(arg), &oid, &ref);
+		if (cnt > 1)
 			die("git upload-pack: ambiguous deepen-not: %s", line);
+		if (cnt < 1)
+			die("git upload-pack: deepen-not is not a ref: %s", line);
 		oidset_insert(deepen_not, &oid);
 		free(ref);
 		*deepen_rev_list = 1;
@@ -1208,7 +1226,7 @@ static int mark_our_ref(const char *refname, const char *refname_full,
 	return 0;
 }
 
-static int check_ref(const char *refname_full, const struct object_id *oid,
+static int check_ref(const char *refname_full, const char *referent UNUSED,const struct object_id *oid,
 		     int flag UNUSED, void *cb_data)
 {
 	const char *refname = strip_namespace(refname_full);
@@ -1276,14 +1294,14 @@ static void write_v0_ref(struct upload_pack_data *data,
 	return;
 }
 
-static int send_ref(const char *refname, const struct object_id *oid,
+static int send_ref(const char *refname, const char *referent UNUSED, const struct object_id *oid,
 		    int flag UNUSED, void *cb_data)
 {
 	write_v0_ref(cb_data, refname, strip_namespace(refname), oid);
 	return 0;
 }
 
-static int find_symref(const char *refname,
+static int find_symref(const char *refname, const char *referent UNUSED,
 		       const struct object_id *oid UNUSED,
 		       int flag, void *cb_data)
 {
@@ -1430,7 +1448,7 @@ void upload_pack(const int advertise_refs, const int stateless_rpc,
 		for_each_namespaced_ref_1(send_ref, &data);
 		if (!data.sent_capabilities) {
 			const char *refname = "capabilities^{}";
-			write_v0_ref(&data, refname, refname, null_oid());
+			write_v0_ref(&data, refname, refname, null_oid(the_hash_algo));
 		}
 		/*
 		 * fflush stdout before calling advertise_shallow_grafts because send_ref
@@ -1538,7 +1556,7 @@ static int parse_want_ref(struct packet_writer *writer, const char *line,
 		}
 
 		if (!o)
-			o = parse_object_or_die(&oid, refname_nons);
+			o = parse_object_or_die(the_repository, &oid, refname_nons);
 
 		if (!(o->flags & WANTED)) {
 			o->flags |= WANTED;
@@ -1762,27 +1780,27 @@ static void send_shallow_info(struct upload_pack_data *data)
 	packet_delim(1);
 }
 
-enum fetch_state {
-	FETCH_PROCESS_ARGS = 0,
-	FETCH_SEND_ACKS,
-	FETCH_SEND_PACK,
-	FETCH_DONE,
+enum upload_state {
+	UPLOAD_PROCESS_ARGS = 0,
+	UPLOAD_SEND_ACKS,
+	UPLOAD_SEND_PACK,
+	UPLOAD_DONE,
 };
 
 int upload_pack_v2(struct repository *r, struct packet_reader *request)
 {
-	enum fetch_state state = FETCH_PROCESS_ARGS;
+	enum upload_state state = UPLOAD_PROCESS_ARGS;
 	struct upload_pack_data data;
 
-	clear_object_flags(ALL_FLAGS);
+	clear_object_flags(the_repository, ALL_FLAGS);
 
 	upload_pack_data_init(&data);
 	data.use_sideband = LARGE_PACKET_MAX;
 	get_upload_pack_config(r, &data);
 
-	while (state != FETCH_DONE) {
+	while (state != UPLOAD_DONE) {
 		switch (state) {
-		case FETCH_PROCESS_ARGS:
+		case UPLOAD_PROCESS_ARGS:
 			process_args(request, &data);
 
 			if (!data.want_obj.nr && !data.wait_for_done) {
@@ -1793,27 +1811,27 @@ int upload_pack_v2(struct repository *r, struct packet_reader *request)
 				 * to just send 'have's without 'want's); guess
 				 * they didn't want anything.
 				 */
-				state = FETCH_DONE;
+				state = UPLOAD_DONE;
 			} else if (data.seen_haves) {
 				/*
 				 * Request had 'have' lines, so lets ACK them.
 				 */
-				state = FETCH_SEND_ACKS;
+				state = UPLOAD_SEND_ACKS;
 			} else {
 				/*
 				 * Request had 'want's but no 'have's so we can
-				 * immedietly go to construct and send a pack.
+				 * immediately go to construct and send a pack.
 				 */
-				state = FETCH_SEND_PACK;
+				state = UPLOAD_SEND_PACK;
 			}
 			break;
-		case FETCH_SEND_ACKS:
+		case UPLOAD_SEND_ACKS:
 			if (process_haves_and_send_acks(&data))
-				state = FETCH_SEND_PACK;
+				state = UPLOAD_SEND_PACK;
 			else
-				state = FETCH_DONE;
+				state = UPLOAD_DONE;
 			break;
-		case FETCH_SEND_PACK:
+		case UPLOAD_SEND_PACK:
 			send_wanted_ref_info(&data);
 			send_shallow_info(&data);
 
@@ -1823,9 +1841,9 @@ int upload_pack_v2(struct repository *r, struct packet_reader *request)
 				packet_writer_write(&data.writer, "packfile\n");
 				create_pack_file(&data, NULL);
 			}
-			state = FETCH_DONE;
+			state = UPLOAD_DONE;
 			break;
-		case FETCH_DONE:
+		case UPLOAD_DONE:
 			continue;
 		}
 	}

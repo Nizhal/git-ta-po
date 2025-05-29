@@ -1,7 +1,7 @@
 #include "git-compat-util.h"
 #include "abspath.h"
 #include "repository.h"
-#include "object-store-ll.h"
+#include "object-store.h"
 #include "config.h"
 #include "object.h"
 #include "lockfile.h"
@@ -54,7 +54,7 @@ void initialize_repository(struct repository *repo)
 {
 	repo->objects = raw_object_store_new();
 	repo->remote_state = remote_state_new();
-	repo->parsed_objects = parsed_object_pool_new();
+	repo->parsed_objects = parsed_object_pool_new(repo);
 	ALLOC_ARRAY(repo->index, 1);
 	index_state_init(repo->index, repo);
 
@@ -89,6 +89,46 @@ static void expand_base_dir(char **out, const char *in,
 		*out = xstrdup(in);
 	else
 		*out = xstrfmt("%s/%s", base_dir, def_in);
+}
+
+const char *repo_get_git_dir(struct repository *repo)
+{
+	if (!repo->gitdir)
+		BUG("repository hasn't been set up");
+	return repo->gitdir;
+}
+
+const char *repo_get_common_dir(struct repository *repo)
+{
+	if (!repo->commondir)
+		BUG("repository hasn't been set up");
+	return repo->commondir;
+}
+
+const char *repo_get_object_directory(struct repository *repo)
+{
+	if (!repo->objects->odb)
+		BUG("repository hasn't been set up");
+	return repo->objects->odb->path;
+}
+
+const char *repo_get_index_file(struct repository *repo)
+{
+	if (!repo->index_file)
+		BUG("repository hasn't been set up");
+	return repo->index_file;
+}
+
+const char *repo_get_graft_file(struct repository *repo)
+{
+	if (!repo->graft_file)
+		BUG("repository hasn't been set up");
+	return repo->graft_file;
+}
+
+const char *repo_get_work_tree(struct repository *repo)
+{
+	return repo->worktree;
 }
 
 static void repo_set_commondir(struct repository *repo,
@@ -243,6 +283,7 @@ int repo_init(struct repository *repo,
 	repo_set_compat_hash_algo(repo, format.compat_hash_algo);
 	repo_set_ref_storage_format(repo, format.ref_storage_format);
 	repo->repository_format_worktree_config = format.worktree_config;
+	repo->repository_format_relative_worktrees = format.relative_worktrees;
 
 	/* take ownership of format.partial_clone */
 	repo->repository_format_partial_clone = format.partial_clone;
@@ -271,8 +312,8 @@ int repo_submodule_init(struct repository *subrepo,
 	struct strbuf worktree = STRBUF_INIT;
 	int ret = 0;
 
-	strbuf_repo_worktree_path(&gitdir, superproject, "%s/.git", path);
-	strbuf_repo_worktree_path(&worktree, superproject, "%s", path);
+	repo_worktree_path_append(superproject, &gitdir, "%s/.git", path);
+	repo_worktree_path_append(superproject, &worktree, "%s", path);
 
 	if (repo_init(subrepo, gitdir.buf, worktree.buf)) {
 		/*
@@ -339,7 +380,7 @@ void repo_clear(struct repository *repo)
 	parsed_object_pool_clear(repo->parsed_objects);
 	FREE_AND_NULL(repo->parsed_objects);
 
-	FREE_AND_NULL(repo->settings.fsmonitor);
+	repo_settings_clear(repo);
 
 	if (repo->config) {
 		git_configset_clear(repo->config);

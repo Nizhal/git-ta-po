@@ -880,6 +880,12 @@ proc apply_config {} {
 			color::sync_with_theme
 		}
 	}
+
+	global comment_string
+	set comment_string [get_config core.commentstring]
+	if {$comment_string eq {}} {
+		set comment_string [get_config core.commentchar]
+	}
 }
 
 set default_config(branch.autosetupmerge) true
@@ -890,6 +896,8 @@ set default_config(merge.summary) false
 set default_config(merge.verbosity) 2
 set default_config(user.name) {}
 set default_config(user.email) {}
+set default_config(core.commentchar) "#"
+set default_config(core.commentstring) {}
 
 set default_config(gui.encoding) [encoding system]
 set default_config(gui.matchtrackingbranch) false
@@ -1357,7 +1365,6 @@ set current_diff_path {}
 set is_3way_diff 0
 set is_submodule_diff 0
 set is_conflict_diff 0
-set diff_empty_count 0
 set last_revert {}
 set last_revert_enc {}
 
@@ -3594,6 +3601,8 @@ $ui_diff tag configure clr1 -font font_diffbold
 $ui_diff tag configure clr4 -underline 1
 
 $ui_diff tag conf d_info -foreground blue -font font_diffbold
+$ui_diff tag conf d_rescan -foreground blue -underline 1 -font font_diffbold
+$ui_diff tag bind d_rescan <Button-1> { clear_diff; rescan ui_ready 0 }
 
 $ui_diff tag conf d_cr -elide true
 $ui_diff tag conf d_@ -font font_diffbold

@@ -1,13 +1,14 @@
 #!/bin/sh
 
 test_description='exercise basic multi-pack bitmap functionality'
+
 . ./test-lib.sh
 . "${TEST_DIRECTORY}/lib-bitmap.sh"
 
-# We'll be writing our own midx and bitmaps, so avoid getting confused by the
+# We'll be writing our own MIDX, so avoid getting confused by the
 # automatic ones.
 GIT_TEST_MULTI_PACK_INDEX=0
-GIT_TEST_MULTI_PACK_INDEX_WRITE_BITMAP=0
+GIT_TEST_MULTI_PACK_INDEX_WRITE_INCREMENTAL=0
 
 # This test exercise multi-pack bitmap functionality where the object order is
 # stored and read from a special chunk within the MIDX, so use the default
@@ -175,8 +176,8 @@ test_midx_bitmap_cases () {
 			comm -13 bitmaps commits >before &&
 			test_line_count = 1 before &&
 
-			perl -ne "printf(\"create refs/tags/include/%d \", $.); print" \
-				<before | git update-ref --stdin &&
+			sed "s|\(.*\)|create refs/tags/include/\1 \1|" before |
+			git update-ref --stdin &&
 
 			rm -fr $midx-$(midx_checksum $objdir).bitmap &&
 			rm -fr $midx &&

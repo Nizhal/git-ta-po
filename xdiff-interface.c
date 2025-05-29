@@ -1,10 +1,11 @@
 #define USE_THE_REPOSITORY_VARIABLE
+#define DISABLE_SIGN_COMPARE_WARNINGS
 
 #include "git-compat-util.h"
 #include "gettext.h"
 #include "config.h"
 #include "hex.h"
-#include "object-store-ll.h"
+#include "object-store.h"
 #include "strbuf.h"
 #include "xdiff-interface.h"
 #include "xdiff/xtypes.h"
@@ -180,7 +181,7 @@ void read_mmblob(mmfile_t *ptr, const struct object_id *oid)
 	unsigned long size;
 	enum object_type type;
 
-	if (oideq(oid, null_oid())) {
+	if (oideq(oid, null_oid(the_hash_algo))) {
 		ptr->ptr = xstrdup("");
 		ptr->size = 0;
 		return;

@@ -1,3 +1,6 @@
+#define USE_THE_REPOSITORY_VARIABLE
+#define DISABLE_SIGN_COMPARE_WARNINGS
+
 #include "../git-compat-util.h"
 #include "win32.h"
 #include <aclapi.h>
@@ -18,6 +21,9 @@
 #include "gettext.h"
 #define SECURITY_WIN32
 #include <sspi.h>
+#include <winternl.h>
+
+#define STATUS_DELETE_PENDING ((NTSTATUS) 0xC0000056)
 
 #define HCAST(type, handle) ((type)(intptr_t)handle)
 
@@ -243,7 +249,8 @@ static enum hide_dotfiles_type hide_dotfiles = HIDE_DOTFILES_DOTGITONLY;
 static char *unset_environment_variables;
 
 int mingw_core_config(const char *var, const char *value,
-		      const struct config_context *ctx, void *cb)
+		      const struct config_context *ctx UNUSED,
+		      void *cb UNUSED)
 {
 	if (!strcmp(var, "core.hidedotfiles")) {
 		if (value && !strcasecmp(value, "dotgitonly"))
@@ -298,7 +305,7 @@ static wchar_t *normalize_ntpath(wchar_t *wbuf)
 	return wbuf;
 }
 
-int mingw_unlink(const char *pathname)
+int mingw_unlink(const char *pathname, int handle_in_use_error)
 {
 	int ret, tries = 0;
 	wchar_t wpathname[MAX_PATH];
@@ -313,6 +320,9 @@ int mingw_unlink(const char *pathname)
 	while ((ret = _wunlink(wpathname)) == -1 && tries < ARRAY_SIZE(delay)) {
 		if (!is_file_in_use_error(GetLastError()))
 			break;
+		if (!handle_in_use_error)
+			return ret;
+
 		/*
 		 * We assume that some other process had the source or
 		 * destination file open at the wrong moment and retry.
@@ -453,7 +463,7 @@ static int set_hidden_flag(const wchar_t *path, int set)
 	return -1;
 }
 
-int mingw_mkdir(const char *path, int mode)
+int mingw_mkdir(const char *path, int mode UNUSED)
 {
 	int ret;
 	wchar_t wpath[MAX_PATH];
@@ -499,7 +509,7 @@ static int mingw_open_append(wchar_t const *wfilename, int oflags, ...)
 	 * to append to the file.
 	 */
 	handle = CreateFileW(wfilename, FILE_APPEND_DATA,
-			FILE_SHARE_WRITE | FILE_SHARE_READ,
+			FILE_SHARE_WRITE | FILE_SHARE_READ | FILE_SHARE_DELETE,
 			NULL, create, FILE_ATTRIBUTE_NORMAL, NULL);
 	if (handle == INVALID_HANDLE_VALUE) {
 		DWORD err = GetLastError();
@@ -530,6 +540,70 @@ static int mingw_open_append(wchar_t const *wfilename, int oflags, ...)
 }
 
 /*
+ * Ideally, we'd use `_wopen()` to implement this functionality so that we
+ * don't have to reimplement it, but unfortunately we do not have tight control
+ * over the share mode there. And while `_wsopen()` and friends exist that give
+ * us _some_ control over the share mode, this family of functions doesn't give
+ * us the ability to enable FILE_SHARE_DELETE, either. But this is a strict
+ * requirement for us though so that we can unlink or rename over files that
+ * are held open by another process.
+ *
+ * We are thus forced to implement our own emulation of `open()`. To make our
+ * life simpler we only implement basic support for this, namely opening
+ * existing files for reading and/or writing. This means that newly created
+ * files won't have their sharing mode set up correctly, but for now I couldn't
+ * find any case where this matters. We may have to revisit that in the future
+ * though based on our needs.
+ */
+static int mingw_open_existing(const wchar_t *filename, int oflags, ...)
+{
+	SECURITY_ATTRIBUTES security_attributes = {
+		.nLength = sizeof(security_attributes),
+		.bInheritHandle = !(oflags & O_NOINHERIT),
+	};
+	HANDLE handle;
+	DWORD access;
+	int fd;
+
+	/* We only support basic flags. */
+	if (oflags & ~(O_ACCMODE | O_NOINHERIT)) {
+		errno = ENOSYS;
+		return -1;
+	}
+
+	switch (oflags & O_ACCMODE) {
+	case O_RDWR:
+		access = GENERIC_READ | GENERIC_WRITE;
+		break;
+	case O_WRONLY:
+		access = GENERIC_WRITE;
+		break;
+	default:
+		access = GENERIC_READ;
+		break;
+	}
+
+	handle = CreateFileW(filename, access,
+			     FILE_SHARE_WRITE | FILE_SHARE_READ | FILE_SHARE_DELETE,
+			     &security_attributes, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+	if (handle == INVALID_HANDLE_VALUE) {
+		DWORD err = GetLastError();
+
+		/* See `mingw_open_append()` for why we have this conversion. */
+		if (err == ERROR_INVALID_PARAMETER)
+			err = ERROR_PATH_NOT_FOUND;
+
+		errno = err_win_to_posix(err);
+		return -1;
+	}
+
+	fd = _open_osfhandle((intptr_t)handle, oflags | O_BINARY);
+	if (fd < 0)
+		CloseHandle(handle);
+	return fd;
+}
+
+/*
  * Does the pathname map to the local named pipe filesystem?
  * That is, does it have a "//./pipe/" prefix?
  */
@@ -553,6 +627,8 @@ int mingw_open (const char *filename, int oflags, ...)
 	wchar_t wfilename[MAX_PATH];
 	open_fn_t open_fn;
 
+	DECLARE_PROC_ADDR(ntdll.dll, NTSTATUS, NTAPI, RtlGetLastNtStatus, void);
+
 	va_start(args, oflags);
 	mode = va_arg(args, int);
 	va_end(args);
@@ -564,6 +640,8 @@ int mingw_open (const char *filename, int oflags, ...)
 
 	if ((oflags & O_APPEND) && !is_local_named_pipe_path(filename))
 		open_fn = mingw_open_append;
+	else if (!(oflags & ~(O_ACCMODE | O_NOINHERIT)))
+		open_fn = mingw_open_existing;
 	else
 		open_fn = _wopen;
 
@@ -574,6 +652,21 @@ int mingw_open (const char *filename, int oflags, ...)
 
 	fd = open_fn(wfilename, oflags, mode);
 
+	/*
+	 * Internally, `_wopen()` uses the `CreateFile()` API with CREATE_NEW,
+	 * which may error out with ERROR_ACCESS_DENIED and an NtStatus of
+	 * STATUS_DELETE_PENDING when the file is scheduled for deletion via
+	 * `DeleteFileW()`. The file essentially exists, so we map errno to
+	 * EEXIST instead of EACCESS so that callers don't have to special-case
+	 * this.
+	 *
+	 * This fixes issues for example with the lockfile interface when one
+	 * process has a lock that it is about to commit or release while
+	 * another process wants to acquire it.
+	 */
+	if (fd < 0 && create && GetLastError() == ERROR_ACCESS_DENIED &&
+	    INIT_PROC_ADDR(RtlGetLastNtStatus) && RtlGetLastNtStatus() == STATUS_DELETE_PENDING)
+		errno = EEXIST;
 	if (fd < 0 && (oflags & O_ACCMODE) != O_RDONLY && errno == EACCES) {
 		DWORD attrs = GetFileAttributesW(wfilename);
 		if (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY))
@@ -597,7 +690,7 @@ int mingw_open (const char *filename, int oflags, ...)
 	return fd;
 }
 
-static BOOL WINAPI ctrl_ignore(DWORD type)
+static BOOL WINAPI ctrl_ignore(DWORD type UNUSED)
 {
 	return TRUE;
 }
@@ -779,7 +872,7 @@ static inline void filetime_to_timespec(const FILETIME *ft, struct timespec *ts)
  */
 static int has_valid_directory_prefix(wchar_t *wfilename)
 {
-	int n = wcslen(wfilename);
+	size_t n = wcslen(wfilename);
 
 	while (n > 0) {
 		wchar_t c = wfilename[--n];
@@ -888,7 +981,7 @@ static int do_lstat(int follow, const char *file_name, struct stat *buf)
  */
 static int do_stat_internal(int follow, const char *file_name, struct stat *buf)
 {
-	int namelen;
+	size_t namelen;
 	char alt_name[PATH_MAX];
 
 	if (!do_lstat(follow, file_name, buf))
@@ -1003,7 +1096,7 @@ int mingw_utime (const char *file_name, const struct utimbuf *times)
 
 	osfilehandle = CreateFileW(wfilename,
 				   FILE_WRITE_ATTRIBUTES,
-				   0 /*FileShare.None*/,
+				   FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
 				   NULL,
 				   OPEN_EXISTING,
 				   (attrs != INVALID_FILE_ATTRIBUTES &&
@@ -1085,7 +1178,7 @@ int mkstemp(char *template)
 	return git_mkstemp_mode(template, 0600);
 }
 
-int gettimeofday(struct timeval *tv, void *tz)
+int gettimeofday(struct timeval *tv, void *tz UNUSED)
 {
 	FILETIME ft;
 	long long hnsec;
@@ -1271,7 +1364,8 @@ static const char *parse_interpreter(const char *cmd)
 {
 	static char buf[100];
 	char *p, *opt;
-	int n, fd;
+	ssize_t n; /* read() can return negative values */
+	int fd;
 
 	/* don't even try a .exe */
 	n = strlen(cmd);
@@ -1336,7 +1430,7 @@ static char *path_lookup(const char *cmd, int exe_only)
 {
 	const char *path;
 	char *prog = NULL;
-	int len = strlen(cmd);
+	size_t len = strlen(cmd);
 	int isexe = len >= 4 && !strcasecmp(cmd+len-4, ".exe");
 
 	if (strpbrk(cmd, "/\\"))
@@ -1953,7 +2047,7 @@ char *mingw_getenv(const char *name)
 #define GETENV_MAX_RETAIN 64
 	static char *values[GETENV_MAX_RETAIN];
 	static int value_counter;
-	int len_key, len_value;
+	size_t len_key, len_value;
 	wchar_t *w_key;
 	char *value;
 	wchar_t w_value[32768];
@@ -1965,7 +2059,8 @@ char *mingw_getenv(const char *name)
 	/* We cannot use xcalloc() here because that uses getenv() itself */
 	w_key = calloc(len_key, sizeof(wchar_t));
 	if (!w_key)
-		die("Out of memory, (tried to allocate %u wchar_t's)", len_key);
+		die("Out of memory, (tried to allocate %"PRIuMAX" wchar_t's)",
+			(uintmax_t)len_key);
 	xutftowcs(w_key, name, len_key);
 	/* GetEnvironmentVariableW() only sets the last error upon failure */
 	SetLastError(ERROR_SUCCESS);
@@ -1980,7 +2075,8 @@ char *mingw_getenv(const char *name)
 	/* We cannot use xcalloc() here because that uses getenv() itself */
 	value = calloc(len_value, sizeof(char));
 	if (!value)
-		die("Out of memory, (tried to allocate %u bytes)", len_value);
+		die("Out of memory, (tried to allocate %"PRIuMAX" bytes)",
+			(uintmax_t)len_value);
 	xwcstoutf(value, w_value, len_value);
 
 	/*
@@ -1998,7 +2094,7 @@ char *mingw_getenv(const char *name)
 
 int mingw_putenv(const char *namevalue)
 {
-	int size;
+	size_t size;
 	wchar_t *wide, *equal;
 	BOOL result;
 
@@ -2008,7 +2104,8 @@ int mingw_putenv(const char *namevalue)
 	size = strlen(namevalue) * 2 + 1;
 	wide = calloc(size, sizeof(wchar_t));
 	if (!wide)
-		die("Out of memory, (tried to allocate %u wchar_t's)", size);
+		die("Out of memory, (tried to allocate %" PRIuMAX " wchar_t's)",
+		    (uintmax_t)size);
 	xutftowcs(wide, namevalue, size);
 	equal = wcschr(wide, L'=');
 	if (!equal)
@@ -2148,10 +2245,16 @@ int mingw_accept(int sockfd1, struct sockaddr *sa, socklen_t *sz)
 #undef rename
 int mingw_rename(const char *pold, const char *pnew)
 {
+	static int supports_file_rename_info_ex = 1;
 	DWORD attrs, gle;
 	int tries = 0;
 	wchar_t wpold[MAX_PATH], wpnew[MAX_PATH];
-	if (xutftowcs_path(wpold, pold) < 0 || xutftowcs_path(wpnew, pnew) < 0)
+	int wpnew_len;
+
+	if (xutftowcs_path(wpold, pold) < 0)
+		return -1;
+	wpnew_len = xutftowcs_path(wpnew, pnew);
+	if (wpnew_len < 0)
 		return -1;
 
 	/*
@@ -2162,11 +2265,86 @@ int mingw_rename(const char *pold, const char *pnew)
 		return 0;
 	if (errno != EEXIST)
 		return -1;
+
 repeat:
-	if (MoveFileExW(wpold, wpnew, MOVEFILE_REPLACE_EXISTING))
-		return 0;
+	if (supports_file_rename_info_ex) {
+		/*
+		 * Our minimum required Windows version is still set to Windows
+		 * Vista. We thus have to declare required infrastructure for
+		 * FileRenameInfoEx ourselves until we bump _WIN32_WINNT to
+		 * 0x0A00. Furthermore, we have to handle cases where the
+		 * FileRenameInfoEx call isn't supported yet.
+		 */
+#define FILE_RENAME_FLAG_REPLACE_IF_EXISTS                  0x00000001
+#define FILE_RENAME_FLAG_POSIX_SEMANTICS                    0x00000002
+		FILE_INFO_BY_HANDLE_CLASS FileRenameInfoEx = 22;
+		struct {
+			/*
+			 * This is usually an unnamed union, but that is not
+			 * part of ISO C99. We thus inline the field, as we
+			 * really only care for the Flags field anyway.
+			 */
+			DWORD Flags;
+			HANDLE RootDirectory;
+			DWORD FileNameLength;
+			/*
+			 * The actual structure is defined with a single-character
+			 * flex array so that the structure has to be allocated on
+			 * the heap. As we declare this structure ourselves though
+			 * we can avoid the allocation and define FileName to have
+			 * MAX_PATH bytes.
+			 */
+			WCHAR FileName[MAX_PATH];
+		} rename_info = { 0 };
+		HANDLE old_handle = INVALID_HANDLE_VALUE;
+		BOOL success;
+
+		old_handle = CreateFileW(wpold, DELETE,
+					 FILE_SHARE_WRITE | FILE_SHARE_READ | FILE_SHARE_DELETE,
+					 NULL, OPEN_EXISTING,
+					 FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+					 NULL);
+		if (old_handle == INVALID_HANDLE_VALUE) {
+			errno = err_win_to_posix(GetLastError());
+			return -1;
+		}
+
+		rename_info.Flags = FILE_RENAME_FLAG_REPLACE_IF_EXISTS |
+				    FILE_RENAME_FLAG_POSIX_SEMANTICS;
+		rename_info.FileNameLength = wpnew_len * sizeof(WCHAR);
+		memcpy(rename_info.FileName, wpnew, wpnew_len * sizeof(WCHAR));
+
+		success = SetFileInformationByHandle(old_handle, FileRenameInfoEx,
+						     &rename_info, sizeof(rename_info));
+		gle = GetLastError();
+		CloseHandle(old_handle);
+		if (success)
+			return 0;
+
+		/*
+		 * When we see ERROR_INVALID_PARAMETER we can assume that the
+		 * current system doesn't support FileRenameInfoEx. Keep us
+		 * from using it in future calls and retry.
+		 */
+		if (gle == ERROR_INVALID_PARAMETER) {
+			supports_file_rename_info_ex = 0;
+			goto repeat;
+		}
+
+		/*
+		 * In theory, we shouldn't get ERROR_ACCESS_DENIED because we
+		 * always open files with FILE_SHARE_DELETE But in practice we
+		 * cannot assume that Git is the only one accessing files, and
+		 * other applications may not set FILE_SHARE_DELETE. So we have
+		 * to retry.
+		 */
+	} else {
+		if (MoveFileExW(wpold, wpnew, MOVEFILE_REPLACE_EXISTING))
+			return 0;
+		gle = GetLastError();
+	}
+
 	/* TODO: translate more errors */
-	gle = GetLastError();
 	if (gle == ERROR_ACCESS_DENIED &&
 	    (attrs = GetFileAttributesW(wpnew)) != INVALID_FILE_ATTRIBUTES) {
 		if (attrs & FILE_ATTRIBUTE_DIRECTORY) {
@@ -2252,7 +2430,7 @@ char *mingw_query_user_email(void)
 	return get_extended_user_info(NameUserPrincipal);
 }
 
-struct passwd *getpwuid(int uid)
+struct passwd *getpwuid(int uid UNUSED)
 {
 	static unsigned initialized;
 	static char user_name[100];
@@ -2304,7 +2482,7 @@ static sig_handler_t timer_fn = SIG_DFL, sigint_fn = SIG_DFL;
  * length to call the signal handler.
  */
 
-static unsigned __stdcall ticktack(void *dummy)
+static unsigned __stdcall ticktack(void *dummy UNUSED)
 {
 	while (WaitForSingleObject(timer_event, timer_interval) == WAIT_TIMEOUT) {
 		mingw_raise(SIGALRM);
@@ -2352,7 +2530,7 @@ static inline int is_timeval_eq(const struct timeval *i1, const struct timeval *
 	return i1->tv_sec == i2->tv_sec && i1->tv_usec == i2->tv_usec;
 }
 
-int setitimer(int type, struct itimerval *in, struct itimerval *out)
+int setitimer(int type UNUSED, struct itimerval *in, struct itimerval *out)
 {
 	static const struct timeval zero;
 	static int atexit_done;
@@ -2671,31 +2849,44 @@ static void setup_windows_environment(void)
 	}
 }
 
-static PSID get_current_user_sid(void)
+static void get_current_user_sid(PSID *sid, HANDLE *linked_token)
 {
 	HANDLE token;
 	DWORD len = 0;
-	PSID result = NULL;
+	TOKEN_ELEVATION_TYPE elevationType;
+	DWORD size;
+
+	*sid = NULL;
+	*linked_token = NULL;
 
 	if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token))
-		return NULL;
+		return;
 
 	if (!GetTokenInformation(token, TokenUser, NULL, 0, &len)) {
 		TOKEN_USER *info = xmalloc((size_t)len);
 		if (GetTokenInformation(token, TokenUser, info, len, &len)) {
 			len = GetLengthSid(info->User.Sid);
-			result = xmalloc(len);
-			if (!CopySid(len, result, info->User.Sid)) {
+			*sid = xmalloc(len);
+			if (!CopySid(len, *sid, info->User.Sid)) {
 				error(_("failed to copy SID (%ld)"),
 				      GetLastError());
-				FREE_AND_NULL(result);
+				FREE_AND_NULL(*sid);
 			}
 		}
 		FREE_AND_NULL(info);
 	}
-	CloseHandle(token);
 
-	return result;
+	if (GetTokenInformation(token, TokenElevationType, &elevationType, sizeof(elevationType), &size) &&
+	    elevationType == TokenElevationTypeLimited) {
+		/*
+		 * The current process is run by a member of the Administrators
+		 * group, but is not running elevated.
+		 */
+		if (!GetTokenInformation(token, TokenLinkedToken, linked_token, sizeof(*linked_token), &size))
+			linked_token = NULL; /* there is no linked token */
+	}
+
+	CloseHandle(token);
 }
 
 static BOOL user_sid_to_user_name(PSID sid, LPSTR *str)
@@ -2776,18 +2967,22 @@ int is_path_owned_by_current_sid(const char *path, struct strbuf *report)
 	else if (sid && IsValidSid(sid)) {
 		/* Now, verify that the SID matches the current user's */
 		static PSID current_user_sid;
+		static HANDLE linked_token;
 		BOOL is_member;
 
 		if (!current_user_sid)
-			current_user_sid = get_current_user_sid();
+			get_current_user_sid(&current_user_sid, &linked_token);
 
 		if (current_user_sid &&
 		    IsValidSid(current_user_sid) &&
 		    EqualSid(sid, current_user_sid))
 			result = 1;
 		else if (IsWellKnownSid(sid, WinBuiltinAdministratorsSid) &&
-			 CheckTokenMembership(NULL, sid, &is_member) &&
-			 is_member)
+			 ((CheckTokenMembership(NULL, sid, &is_member) &&
+			   is_member) ||
+			  (linked_token &&
+			   CheckTokenMembership(linked_token, sid, &is_member) &&
+			   is_member)))
 			/*
 			 * If owned by the Administrators group, and the
 			 * current user is an administrator, we consider that
@@ -3082,7 +3277,8 @@ static void maybe_redirect_std_handles(void)
  */
 int wmain(int argc, const wchar_t **wargv)
 {
-	int i, maxlen, exit_status;
+	int i, exit_status;
+	size_t maxlen;
 	char *buffer, **save;
 	const char **argv;
 
